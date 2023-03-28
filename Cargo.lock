@@ -127,6 +127,7 @@ name = "ent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "env_logger",
  "log",
  "once_cell",

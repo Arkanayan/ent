@@ -1,5 +1,5 @@
 
-enum MessageType {
+enum Message {
     HandShake,
     KeepAlive,
     Choke,

@@ -7,6 +7,9 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+
+pub type PeerID = [u8; 20];
+
 #[derive(Debug, Deserialize)]
 pub struct Node(String, i64);
 
@@ -40,7 +43,7 @@ pub struct Info {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Torrent {
+pub struct MetaInfo {
     pub info: Info,
     #[serde(default)]
     pub announce: Option<String>,
@@ -63,7 +66,7 @@ pub struct Torrent {
     pub created_by: Option<String>,
 }
 
-impl Torrent {
+impl MetaInfo {
     pub fn num_pieces(&self) -> usize {
         self.info.pieces.len() / 20
     }
@@ -81,11 +84,11 @@ impl Torrent {
     }
 }
 
-pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<Torrent> {
+pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {
     let mut bytes = Vec::new();
     let mut f = fs::File::open(path.as_ref())?;
     let _ = f.read_to_end(&mut bytes)?;
 
-    let deserialized: Torrent = serde_bencode::from_bytes(bytes.as_slice())?;
+    let deserialized: MetaInfo = serde_bencode::from_bytes(bytes.as_slice())?;
     Ok(deserialized)
 }
