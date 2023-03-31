@@ -76,11 +76,11 @@ impl MetaInfo {
         &self.info.pieces[piece_start..piece_start + 20]
     }
 
-    pub fn info_hash(&self) -> Vec<u8> {
+    pub fn info_hash(&self) -> [u8; 20] {
         let mut hasher = Sha1::new();
         hasher.update(serde_bencode::to_bytes(&self.info).unwrap());
         let result = hasher.finalize();
-        result.to_vec()
+        result.into()
     }
 }
 
