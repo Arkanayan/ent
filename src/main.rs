@@ -8,6 +8,7 @@ mod tracker;
 mod connection;
 mod protocol;
 mod messages;
+mod torrent;
 
 
 static PEER_ID: Lazy<metainfo::PeerID> = Lazy::new(|| {
