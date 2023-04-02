@@ -1,5 +1,4 @@
 use anyhow::Result;
-use log::info;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
@@ -10,10 +9,10 @@ use std::path::Path;
 
 pub type PeerID = [u8; 20];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Node(String, i64);
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct File {
     pub path: Vec<String>,
     pub length: i64,
@@ -21,7 +20,7 @@ pub struct File {
     pub md5sum: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Info {
     pub name: String,
     pub pieces: ByteBuf,
@@ -42,7 +41,7 @@ pub struct Info {
     pub root_hash: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaInfo {
     pub info: Info,
     #[serde(default)]

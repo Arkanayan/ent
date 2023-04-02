@@ -1,12 +1,10 @@
 use anyhow::anyhow;
 use bitvec::prelude::{BitVec, Msb0};
-use bitvec::vec;
 use bytes::{Buf, BufMut, Bytes};
-use log::info;
+use std::io;
 use std::io::{prelude::*, Cursor};
 use tokio::io::AsyncReadExt;
 use tokio_util::codec::{Decoder, Encoder};
-use std::io;
 
 use crate::metainfo::PeerID;
 use crate::torrent::{BlockData, BlockInfo};
@@ -54,7 +52,6 @@ impl Encoder<HandShake> for HandShakeCodec {
         dst.extend_from_slice(&hand_shake.info_hash);
         dst.extend_from_slice(&hand_shake.peer_id);
 
-        info!("Length of dst buffer: {}", dst.len());
         Ok(())
     }
 }
@@ -153,16 +150,12 @@ pub enum Message {
     Have(usize),
     BitField(BitField),
     Request(BlockInfo),
-    Piece {
-        piece_index: usize,
-        offset: u32,
-        data: Bytes
-    },
+    Piece(BlockData),
     Cancel(BlockInfo),
     Port(u16),
 }
 
-type BitField = BitVec<u8, Msb0>;
+pub type BitField = BitVec<u8, Msb0>;
 
 #[derive(Debug)]
 pub struct MessageCodec;
@@ -196,37 +189,45 @@ impl Encoder<Message> for MessageCodec {
                 dst.reserve(4 + 4);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::Interested as u8);
-            },
+            }
             NotInterested => {
                 let msg_len = 1;
                 dst.reserve(4 + 4);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::NotInterested as u8);
-            },
+            }
             Have(index) => {
                 let msg_len = 1 + 4;
                 dst.reserve(4 * 3);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Have as u8);
                 dst.put_u32(index as u32);
-            },
+            }
             BitField(bv) => {
                 let msg_len = 1 + bv.len() / 8;
                 dst.reserve(4 + 4);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::BitField as u8);
                 dst.extend_from_slice(bv.as_raw_slice());
-            },
-            Request(BlockInfo { piece_index, start, length }) => {
+            }
+            Request(BlockInfo {
+                piece_index,
+                start,
+                length,
+            }) => {
                 let msg_len = 1 + 4 + 4 + 4;
-                dst.reserve( 4 + msg_len * 4);
+                dst.reserve(4 + msg_len * 4);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Request as u8);
                 dst.put_u32(piece_index as u32);
                 dst.put_u32(start);
                 dst.put_u32(length);
-            },
-            Piece {piece_index, offset, mut data }=> {
+            }
+            Piece(BlockData {
+                piece_index,
+                offset,
+                mut data,
+            }) => {
                 let msg_len = 1 + 4 + 4 + data.len();
                 dst.reserve(4 + msg_len * 4);
                 dst.put_u32(msg_len as u32);
@@ -234,17 +235,20 @@ impl Encoder<Message> for MessageCodec {
                 dst.put_u32(piece_index as u32);
                 dst.put_u32(offset);
                 data.copy_to_slice(dst);
-            },
-            Cancel(BlockInfo { piece_index, start, length }) => {
+            }
+            Cancel(BlockInfo {
+                piece_index,
+                start,
+                length,
+            }) => {
                 let msg_len = 1 + 4 + 4 + 4;
-                dst.reserve( 4 + msg_len * 4);
+                dst.reserve(4 + msg_len * 4);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Cancel as u8);
                 dst.put_u32(piece_index as u32);
                 dst.put_u32(start);
                 dst.put_u32(length);
-
-            },
+            }
             Port(port) => {
                 let msg_len = 1 + 2;
                 dst.reserve(1 + msg_len * 4);
@@ -257,8 +261,7 @@ impl Encoder<Message> for MessageCodec {
     }
 }
 
-
-impl Decoder for Message {
+impl Decoder for MessageCodec {
     type Item = Message;
 
     type Error = anyhow::Error;
@@ -279,7 +282,7 @@ impl Decoder for Message {
         cursor.set_position(0);
 
         // Whole frame hasn't received yet
-        if src.remaining() <  4 + msg_len {
+        if src.remaining() < 4 + msg_len {
             return Ok(None);
         }
 
@@ -299,46 +302,58 @@ impl Decoder for Message {
             MessageId::NotInterested => Message::NotInterested,
             MessageId::Have => {
                 let piece_index = src.get_u32();
-                let piece_index = piece_index.try_into().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, e)
-                })?;
+                let piece_index = piece_index
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 Message::Have(piece_index)
             }
             MessageId::BitField => {
                 let mut bitfield = vec![0; msg_len - 1];
                 src.copy_to_slice(&mut bitfield);
                 Message::BitField(BitField::from_vec(bitfield))
-            },
+            }
             MessageId::Request => {
                 let piece_index = src.get_u32();
                 let begin = src.get_u32();
                 let length = src.get_u32();
 
-                let piece_index = piece_index.try_into().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, e)
-                })?;
-                Message::Request(BlockInfo { piece_index: piece_index, start: begin, length: length })
+                let piece_index = piece_index
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                Message::Request(BlockInfo {
+                    piece_index: piece_index,
+                    start: begin,
+                    length: length,
+                })
             }
             MessageId::Piece => {
                 let piece_index = src.get_u32();
                 let offset = src.get_u32();
-                let mut data = Vec::with_capacity(msg_len - 4 - 4);
+                let mut data = vec![0; msg_len - 1 - 4 - 4];
                 src.copy_to_slice(&mut data);
-
-                let piece_index = piece_index.try_into().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, e)
-                })?;
-                Message::Piece { piece_index: piece_index, offset: offset, data: data.into() }
+                
+                let piece_index = piece_index
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                Message::Piece(BlockData {
+                    piece_index: piece_index,
+                    offset: offset,
+                    data: data.into(),
+                })
             }
             MessageId::Cancel => {
                 let piece_index = src.get_u32();
                 let begin = src.get_u32();
                 let length = src.get_u32();
 
-                let piece_index = piece_index.try_into().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, e)
-                })?;
-                Message::Cancel(BlockInfo { piece_index: piece_index, start: begin, length: length })
+                let piece_index = piece_index
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                Message::Cancel(BlockInfo {
+                    piece_index: piece_index,
+                    start: begin,
+                    length: length,
+                })
             }
             MessageId::Port => {
                 let port = src.get_u16();
