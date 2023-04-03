@@ -23,12 +23,31 @@ pub struct TorrentInfo {
 pub struct TorrentContext {
     pub peer_id: PeerID,
     pub info_hash: [u8; 20],
-    pub pieces: Vec<PieceInfo>,
-    pub blocks: Vec<BlockInfo>,
-    pub in_transit_blocks: RwLock<HashSet<BlockInfo>>,
-    pub available_blocks: RwLock<HashSet<BlockInfo>>
+    pub pieces: Vec<PieceDownload>,
+    pub in_transit_blocks: RwLock<HashSet<BlockDownload>>,
+    pub available_blocks: RwLock<HashSet<BlockDownload>>
 }
 
+#[derive(Debug)]
+pub struct PieceDownload {
+    pub index: usize,
+    pub len: u32,
+    pub blocks: Vec<BlockDownload>
+}
+
+#[derive(Debug)]
+pub struct BlockDownload {
+    pub piece_index: usize,
+    pub index: usize,
+    pub state: DownloadState
+}
+
+#[derive(Debug)]
+pub enum DownloadState {
+    Free,
+    Requested,
+    Downloaded 
+}
 
 #[derive(Debug, Clone)]
 pub struct PieceInfo {
@@ -145,11 +164,26 @@ impl Torrent {
 
     pub async fn run(&mut self) -> Result<()> {
         const TOTAL_PEERS: usize = 30;
+        const MAX_BLOCK_SIZE: u32 = 1 << 14;
+
+        let mut pieces = Vec::with_capacity(self.torrent.pieces.len());
+
+        for p in &self.torrent.pieces {
+            let piece_index = p.index;
+
+            let num_blocks = ((p.length as i32 / MAX_BLOCK_SIZE as i32) as f32).ceil() as usize;
+
+            let mut blocks = Vec::with_capacity(num_blocks);
+
+            for i in 0..num_blocks {
+                blocks.push(BlockDownload{ piece_index: piece_index, index: i, state: DownloadState::Free});
+            }
+            pieces.push(PieceDownload{index: piece_index, len: p.length, blocks: blocks});
+        }
 
         let torrent_context = TorrentContext {
             peer_id: self.client_id,
-            blocks: self.torrent.blocks.clone(),
-            pieces: self.torrent.pieces.clone(),
+            pieces: pieces,
             available_blocks: RwLock::new(HashSet::new()),
             in_transit_blocks: RwLock::new(HashSet::new()),
             info_hash: self.torrent.info_hash.clone(),
