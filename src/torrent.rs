@@ -1,4 +1,4 @@
-use std::{collections::{HashSet, HashMap}, io::Cursor, net::SocketAddr, sync::Arc};
+use std::{collections::{HashSet, HashMap}, io::Cursor, net::SocketAddr, sync::Arc, default};
 
 use bytes::{Buf, Bytes};
 use tokio::{sync::{RwLock, mpsc}, task::JoinHandle};
@@ -7,7 +7,8 @@ use tracing::info;
 
 use crate::{
     metainfo::{self, MetaInfo, PeerID},
-    tracker::TrackerData, peer::{self, PeerSession},
+    tracker::TrackerData, peer::{self, PeerSession}, piece_picker::{PiecePicker, Piece},
+    storage::StorageInfo
 };
 
 #[derive(Debug)]
@@ -15,17 +16,18 @@ pub struct TorrentInfo {
     pub info_hash: [u8; 20],
     pub pieces: Vec<PieceInfo>,
     pub peers: Vec<SocketAddr>,
-    pub blocks: Vec<BlockInfo>,
     pub metainfo: MetaInfo,
 }
 
+type PieceIndex = usize;
+
 #[derive(Debug)]
 pub struct TorrentContext {
-    pub peer_id: PeerID,
+    pub storage: StorageInfo,
     pub info_hash: [u8; 20],
-    pub pieces: Vec<PieceDownload>,
-    pub in_transit_blocks: RwLock<HashSet<BlockDownload>>,
-    pub available_blocks: RwLock<HashSet<BlockDownload>>
+    pub client_id: PeerID,
+    pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
+    pub piece_picker: RwLock<PiecePicker>
 }
 
 #[derive(Debug)]
@@ -35,18 +37,25 @@ pub struct PieceDownload {
     pub blocks: Vec<BlockDownload>
 }
 
-#[derive(Debug)]
-pub struct BlockDownload {
-    pub piece_index: usize,
-    pub index: usize,
-    pub state: DownloadState
+impl PieceDownload {
+    pub fn free_block(&mut self, block_info: &BlockInfo) {
+        let block_index = block_in(self.len, block_info.start);
+
+        self.blocks[block_index] = BlockDownload::Free;
+    }
 }
 
-#[derive(Debug)]
-pub enum DownloadState {
+fn block_in(piece_length: u32, block_start: u32) -> usize {
+    (((piece_length - block_start) as f32) / peer::MAX_BLOCK_SIZE as f32).ceil() as usize
+}
+
+
+#[derive(Debug, Default)]
+pub enum BlockDownload {
+    #[default]
     Free,
     Requested,
-    Downloaded 
+    Received 
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,12 @@ pub struct BlockInfo {
     pub piece_index: usize,
     pub start: u32,
     pub length: u32,
+}
+
+impl BlockInfo {
+    pub fn piece_index(&self) -> PieceIndex {
+        self.piece_index
+    }
 }
 
 #[derive(Debug)]
@@ -83,7 +98,7 @@ impl TorrentInfo {
         // debug_assert_eq!((length / meta_info.info.piece_length)f32).ceil() as usize, num_pieces);
 
         let mut pieces = Vec::with_capacity(num_pieces);
-        let mut blocks = Vec::new();
+        // let mut blocks = Vec::new();
 
         let mut temp_sha1 = Cursor::new(&meta_info.info.pieces);
 
@@ -110,31 +125,30 @@ impl TorrentInfo {
 
             let num_blocks = ((p_len / block_size as i64) as f64).ceil() as usize;
 
-            let mut tmp_block_len = p_len;
+            // let mut tmp_block_len = p_len;
 
-            for block_index in 0..num_blocks {
-                tmp_block_len = tmp_block_len - block_size as i64;
+            // for block_index in 0..num_blocks {
+            //     tmp_block_len = tmp_block_len - block_size as i64;
 
-                let current_block_size = if tmp_block_len < block_size as i64 {
-                    tmp_block_len
-                } else {
-                    block_size as i64
-                };
+            //     let current_block_size = if tmp_block_len < block_size as i64 {
+            //         tmp_block_len
+            //     } else {
+            //         block_size as i64
+            //     };
 
-                let offset = block_size * block_index as u64;
+            //     let offset = block_size * block_index as u64;
 
-                blocks.push(BlockInfo {
-                    piece_index: index,
-                    start: offset as u32,
-                    length: current_block_size as u32,
-                });
+            //     blocks.push(BlockInfo {
+            //         piece_index: index,
+            //         start: offset as u32,
+            //         length: current_block_size as u32,
+            //     });
             }
-        }
+        // }
         Self {
             info_hash: meta_info.info_hash(),
             pieces: pieces,
             peers: tracker_data.peers.clone(),
-            blocks: blocks,
             metainfo: meta_info.clone(),
         }
     }
@@ -149,52 +163,54 @@ pub enum Command {
 
 pub struct Torrent {
     pub client_id: PeerID,
-    pub torrent: TorrentInfo,
+    pub ctx: Arc<TorrentContext>,
+    pub peers: Vec<SocketAddr>,
     pub join_handles: HashMap<SocketAddr, JoinHandle<Result<()>>>,
 }
 
 impl Torrent {
     pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self {
+
+        let torrent_context = TorrentContext {
+            client_id,
+            piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
+            downloads: Default::default(),
+            info_hash: torrent.info_hash,
+            storage: StorageInfo::new(torrent.pieces.len())
+        };
         Self {
             client_id,
-            torrent: torrent,
+            ctx: Arc::new(torrent_context),
+            peers: torrent.peers,
             join_handles: HashMap::new()
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        const TOTAL_PEERS: usize = 30;
-        const MAX_BLOCK_SIZE: u32 = 1 << 14;
 
-        let mut pieces = Vec::with_capacity(self.torrent.pieces.len());
+        // let mut pieces = Vec::with_capacity(self.torrent.pieces.len());
+        // let num_pieces = pieces.len();
+        // for p in &self.torrent.pieces {
+        //     let piece_index = p.index;
 
-        for p in &self.torrent.pieces {
-            let piece_index = p.index;
+        //     let num_blocks = ((p.length as i32 / MAX_BLOCK_SIZE as i32) as f32).ceil() as usize;
 
-            let num_blocks = ((p.length as i32 / MAX_BLOCK_SIZE as i32) as f32).ceil() as usize;
+        //     let mut blocks = Vec::with_capacity(num_blocks);
 
-            let mut blocks = Vec::with_capacity(num_blocks);
+        //     for i in 0..num_blocks {
+        //         blocks.push(BlockDownload{ piece_index: piece_index, index: i, state: DownloadState::Free});
+        //     }
+        //     pieces.push(PieceDownload{index: piece_index, len: p.length, blocks: blocks});
+        // }
 
-            for i in 0..num_blocks {
-                blocks.push(BlockDownload{ piece_index: piece_index, index: i, state: DownloadState::Free});
-            }
-            pieces.push(PieceDownload{index: piece_index, len: p.length, blocks: blocks});
-        }
 
-        let torrent_context = TorrentContext {
-            peer_id: self.client_id,
-            pieces: pieces,
-            available_blocks: RwLock::new(HashSet::new()),
-            in_transit_blocks: RwLock::new(HashSet::new()),
-            info_hash: self.torrent.info_hash.clone(),
-        };
+        const TOTAL_PEERS: usize = 2;
 
-        let ctx = Arc::new(torrent_context);
-        let peers_to_connect = self.torrent.peers.drain(0..self.torrent.peers.len().min(TOTAL_PEERS)).collect::<Vec<_>>();
+        let peers_to_connect = self.peers.drain(0..self.peers.len().min(TOTAL_PEERS)).collect::<Vec<_>>();
 
         for peer in peers_to_connect {
-            let mut peer_session = PeerSession::new(ctx.clone(), peer.clone());
-            let handle = tokio::spawn(async move { peer_session.run().await });
+            let mut peer_session = PeerSession::new(self.ctx.clone(), peer.clone());
+            let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.join_handles.insert(peer.clone(), handle);
         }
 
