@@ -7,8 +7,8 @@ use tracing::info;
 
 use crate::{
     metainfo::{self, MetaInfo, PeerID},
-    tracker::TrackerData, peer::{self, PeerSession}, piece_picker::{PiecePicker, Piece},
-    storage::StorageInfo
+    tracker::TrackerData, peer::{self, PeerSession, MAX_BLOCK_SIZE}, piece_picker::{PiecePicker, Piece},
+    storage::StorageInfo, units::PieceIndex
 };
 
 #[derive(Debug)]
@@ -19,7 +19,6 @@ pub struct TorrentInfo {
     pub metainfo: MetaInfo,
 }
 
-type PieceIndex = usize;
 
 #[derive(Debug)]
 pub struct TorrentContext {
@@ -42,6 +41,20 @@ impl PieceDownload {
         let block_index = block_in(self.len, block_info.start);
 
         self.blocks[block_index] = BlockDownload::Free;
+    }
+
+    pub fn get_next_block(&self, current_block: &BlockInfo) -> Option<(usize, BlockInfo)> {
+
+        if current_block.piece_index != self.index {
+            return None;
+        }
+
+        let block_index = block_in(self.len, current_block.start);
+        if block_index > self.blocks.len() { return None };
+        let block_start = block_index as u32 * MAX_BLOCK_SIZE;
+        let length = (self.len - block_start).min(MAX_BLOCK_SIZE);
+
+        return Some((block_index, BlockInfo {piece_index: self.index, start: block_start, length: length }))
     }
 }
 

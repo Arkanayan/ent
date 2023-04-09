@@ -2,15 +2,17 @@ use std::{
     collections::HashSet,
     hash::Hash,
     net::SocketAddr,
+    ops::Index,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
-use futures::{stream::SplitSink, SinkExt, StreamExt, executor::block_on};
+use bitvec::macros::internal::funty::Integral;
+use futures::{executor::block_on, stream::SplitSink, SinkExt, StreamExt};
 use tokio::{net::TcpStream, time};
 use tokio_util::codec::{Framed, FramedParts};
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::{
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
@@ -253,9 +255,9 @@ impl PeerSession {
                     self.state.is_choked = false;
 
                     if self.state.is_interested {
-                        
+                        self.make_requests(sink).await?
                     }
-                } 
+                }
             }
             Message::Interested => self.handle_interested_msg(sink).await?,
             Message::NotInterested => self.handle_not_interested_msg(sink).await?,
@@ -277,11 +279,10 @@ impl PeerSession {
 
         for block_info in self.requested_blocks.drain() {
             if let Some(download) = download_guard.get(&block_info.piece_index()) {
-               debug!("Freeing block: {:?}", block_info);
-               download.write().await.free_block(&block_info);
+                debug!("Freeing block: {:?}", block_info);
+                download.write().await.free_block(&block_info);
             }
         }
-
     }
 
     async fn handle_unchoke_msg(
@@ -367,7 +368,6 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         is_interested: bool,
     ) -> Result<()> {
-
         if !self.state.is_interested && is_interested {
             sink.send(Message::Interested).await?;
             info!("Became interested in peer");
@@ -394,5 +394,45 @@ impl PeerSession {
         instant: Instant,
     ) -> Result<()> {
         Ok(())
+    }
+
+    async fn make_requests(
+        &self,
+        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
+    ) -> Result<()> {
+        const REQUEST_QUEUE_SIZE: usize = 8;
+
+        let requests_left = REQUEST_QUEUE_SIZE.saturating_sub(self.in_download_blocks.len());
+
+        if requests_left == 0 {
+            return Ok(());
+        }
+
+        let mut request_queue = Vec::with_capacity(requests_left);
+        let mut request_indices = Vec::with_capacity(requests_left);
+
+        let mut in_download_piece_map = self.torrent.downloads.write().await;
+
+        // First try to complete alredy downloading pieces
+        for block in &self.in_download_blocks {
+            if let Some(piece) = in_download_piece_map.get(&block.piece_index()) {
+                let piece_download = piece.read().await;
+
+                if request_queue.len() >= REQUEST_QUEUE_SIZE {
+                    break;
+                }
+                if let Some((index, new_block)) = piece_download.get_next_block(&block) {
+                    request_queue.push(new_block);
+                    request_indices.push((piece_download.index, index));
+                }
+            }
+        }
+
+        // If the queue is still not filled; grab new piece
+        if request_queue.len() < requests_left {
+
+        }
+
+        todo!()
     }
 }

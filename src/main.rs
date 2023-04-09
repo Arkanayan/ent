@@ -16,6 +16,7 @@ mod torrent;
 mod peer;
 mod piece_picker;
 mod storage;
+mod units;
 
 
 static PEER_ID: Lazy<metainfo::PeerID> = Lazy::new(|| {
