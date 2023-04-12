@@ -50,6 +50,7 @@ impl PiecePicker {
 
             if !have_piece {
                 interested = true;
+                self.free_count += 1;
             }
             self.pieces[index].frequency += 1;
         }
@@ -57,10 +58,17 @@ impl PiecePicker {
         return interested;
     }
 
-	pub fn register_peer_piece(&mut self, piece: &PieceIndex) -> bool {
+	pub fn register_peer_piece(&mut self, index: PieceIndex) -> bool {
 		let mut interested = false;
 
-		self.
+		let peer_piece = &mut self.pieces[index];
+        peer_piece.frequency += 1;
+
+        if !self.own_pieces[index] {
+            self.free_count += 1;
+            interested = true;
+        }
+       interested 
 	}
 
     pub fn pick_piece(&mut self, peer_pieces: &BitField) -> Option<PieceIndex> {
@@ -70,11 +78,33 @@ impl PiecePicker {
 				continue;
 			} else {
 				piece.is_pending = true;
-				self.free_count 
+				self.free_count -= 1;
 				return Some(next_piece_index);
 			}
 		}
-
 		return None;
+    }
+
+    /// Registers that we have received the piece
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the piece already there
+    pub fn received_piece(&mut self, index: PieceIndex) {
+        tracing::trace!("Registering received piece: {}", index);
+
+        let mut have_piece = self.own_pieces.get_mut(index).expect("Invalid piece index");
+        assert!(!*have_piece);
+
+        *have_piece = true;
+        self.missing_count -= 1;
+
+        let piece = &mut self.pieces[index];
+
+        if !piece.is_pending {
+            self.free_count -= 1;
+            piece.is_pending = false;
+        }
+
     }
 }

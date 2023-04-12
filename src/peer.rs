@@ -5,19 +5,22 @@ use std::{
     ops::Index,
     sync::Arc,
     time::{Duration, Instant},
+    iter::Extend
 };
 
 use anyhow::{anyhow, Result};
 use bitvec::macros::internal::funty::Integral;
 use futures::{executor::block_on, stream::SplitSink, SinkExt, StreamExt};
-use tokio::{net::TcpStream, time};
+use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::codec::{Framed, FramedParts};
 use tracing::{debug, info};
 
 use crate::{
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
     metainfo::{MetaInfo, PeerID},
-    torrent::{BlockData, BlockInfo, TorrentContext, TorrentInfo},
+    torrent::{
+        block_in, BlockData, BlockInfo, BlockStatus, PieceDownload, TorrentContext, TorrentInfo,
+    },
     tracker::TrackerData,
 };
 pub const MAX_BLOCK_SIZE: u32 = 1 << 14;
@@ -36,8 +39,7 @@ pub enum ConnectionState {
 pub struct PeerSession {
     pub log_target: String,
     pub state: SessionState,
-    pub in_download_blocks: HashSet<BlockInfo>,
-    pub requested_blocks: HashSet<BlockInfo>,
+    pub outgoing_requests: HashSet<BlockInfo>,
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
 }
@@ -85,10 +87,9 @@ impl PeerSession {
                 pieces: BitField::with_capacity(piece_count),
                 piece_count: piece_count,
             },
-            in_download_blocks: HashSet::new(),
+            outgoing_requests: HashSet::new(),
             torrent: torrent_context,
             state: Default::default(),
-            requested_blocks: HashSet::new(),
             log_target: format!("ent::peer [{}]", addr),
         }
     }
@@ -259,15 +260,69 @@ impl PeerSession {
                     }
                 }
             }
-            Message::Interested => self.handle_interested_msg(sink).await?,
-            Message::NotInterested => self.handle_not_interested_msg(sink).await?,
-            Message::Have(piece_index) => self.handle_have_msg(sink, piece_index).await?,
+            Message::Interested => {
+                tracing::info!("Peer is interested in us. Nothing to do here!");
+                self.state.is_peer_interested = true;
+            }
+            Message::NotInterested => {
+                tracing::info!("Peer is not interested in us. Nothing to do here!");
+                self.state.is_peer_interested = false;
+            }
+            Message::Have(piece_index) => {
+                tracing::info!("Peer has piece {}", piece_index);
+                if let Some(mut peer_piece) = self.peer.pieces.get_mut(piece_index) {
+                    *peer_piece = true;
+                }
+                let is_interested = self
+                    .torrent
+                    .piece_picker
+                    .write()
+                    .await
+                    .register_peer_piece(piece_index);
+
+                self.update_interest(sink, is_interested).await?;
+            }
             Message::BitField(_) => {
                 return Err(anyhow!("Bitfield message is not allowed at this stage"))
             }
-            Message::Request(piece_block) => self.handle_request_msg(sink, piece_block).await?,
-            Message::Piece(block_data) => self.handle_piece_msg(sink, block_data).await?,
-            Message::Cancel(piece_block) => self.handle_cancel_msg(sink, piece_block).await?,
+            Message::Request(piece_block) => {
+                tracing::info!("Peer requested piece {}", piece_block.piece_index);
+            }
+            Message::Piece(block_data) => {
+                tracing::info!(
+                    "Peer send us piece {} of block offset {}",
+                    block_data.piece_index,
+                    block_data.offset
+                );
+
+                // Notify everyone we got block
+                let mut piece_complete = false;
+                let mut download_guard = self.torrent.downloads.write().await;
+                if let Some(piece_download) = &mut download_guard.get_mut(&block_data.piece_index) {
+                    let mut piece_download_guard = piece_download.write().await;
+                    let block_index = block_in(piece_download_guard.len, block_data.offset);
+                    piece_download_guard.blocks[block_index] = BlockStatus::Received;
+
+                    if piece_download_guard
+                        .blocks
+                        .iter()
+                        .all(|b| *b == BlockStatus::Received)
+                    {
+                        piece_complete = true;
+                    }
+                }
+                if piece_complete {
+                    tracing::info!("Completed piece {}", block_data.piece_index);
+                    self.torrent
+                        .piece_picker
+                        .write()
+                        .await
+                        .received_piece(block_data.piece_index);
+                }
+            }
+            Message::Cancel(piece_block) => {
+                tracing::info!("Peer sent cancel of piece {}", piece_block.piece_index);
+            }
             Message::Port(listen_port) => info!("Port message received: {}", listen_port),
         }
 
@@ -277,60 +332,12 @@ impl PeerSession {
     async fn free_pending_blocks(&mut self) {
         let download_guard = self.torrent.downloads.write().await;
 
-        for block_info in self.requested_blocks.drain() {
+        for block_info in self.outgoing_requests.drain() {
             if let Some(download) = download_guard.get(&block_info.piece_index()) {
                 debug!("Freeing block: {:?}", block_info);
                 download.write().await.free_block(&block_info);
             }
         }
-    }
-
-    async fn handle_unchoke_msg(
-        &mut self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-    ) -> Result<()> {
-        self.state.is_choked = false;
-
-        // Time for making some requests
-        Ok(())
-    }
-
-    async fn handle_interested_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn handle_not_interested_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn handle_have_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-        piece_index: usize,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn handle_request_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-        piece_block: BlockInfo,
-    ) -> Result<()> {
-        todo!()
-    }
-
-    async fn handle_piece_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-        block_data: BlockData,
-    ) -> Result<()> {
-        todo!()
     }
 
     async fn handle_bitfield_msg(
@@ -358,7 +365,7 @@ impl PeerSession {
             );
         }
 
-        self.update_interest(sink, interested).await?;
+        self.update_interest(sink, interested).await;
 
         Ok(())
     }
@@ -380,13 +387,6 @@ impl PeerSession {
         Ok(())
     }
 
-    async fn handle_cancel_msg(
-        &self,
-        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-        piece_block: BlockInfo,
-    ) -> Result<()> {
-        todo!()
-    }
 
     async fn handle_tick(
         &mut self,
@@ -397,42 +397,94 @@ impl PeerSession {
     }
 
     async fn make_requests(
-        &self,
+        &mut self,
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
     ) -> Result<()> {
         const REQUEST_QUEUE_SIZE: usize = 8;
 
-        let requests_left = REQUEST_QUEUE_SIZE.saturating_sub(self.in_download_blocks.len());
+        let mut requests_left = REQUEST_QUEUE_SIZE.saturating_sub(self.outgoing_requests.len());
 
         if requests_left == 0 {
             return Ok(());
         }
 
         let mut request_queue = Vec::with_capacity(requests_left);
-        let mut request_indices = Vec::with_capacity(requests_left);
 
         let mut in_download_piece_map = self.torrent.downloads.write().await;
 
         // First try to complete alredy downloading pieces
-        for block in &self.in_download_blocks {
+        for block in &self.outgoing_requests {
             if let Some(piece) = in_download_piece_map.get(&block.piece_index()) {
-                let piece_download = piece.read().await;
-
-                if request_queue.len() >= REQUEST_QUEUE_SIZE {
+                if requests_left <= 0 {
                     break;
                 }
-                if let Some((index, new_block)) = piece_download.get_next_block(&block) {
-                    request_queue.push(new_block);
-                    request_indices.push((piece_download.index, index));
+
+                let new_blocks = piece.write().await.pick_blocks(requests_left);
+                if new_blocks.len() > 0 {
+                    requests_left -= new_blocks.len();
+                    request_queue.extend(new_blocks.into_iter());
                 }
             }
         }
 
         // If the queue is still not filled; grab new piece
-        if request_queue.len() < requests_left {
+        for _ in 0..requests_left {
+            if let Some(piece_index) = self
+                .torrent
+                .piece_picker
+                .write()
+                .await
+                .pick_piece(&self.peer.pieces)
+            {
+                if let Some(piece_download_guard) =
+                    self.torrent.downloads.write().await.get_mut(&piece_index)
+                {
+                    let mut piece_download = piece_download_guard.write().await;
+                    let picked_blocks = piece_download.pick_blocks(requests_left);
+                    let num_picked_blocks = picked_blocks.len();
+                    if num_picked_blocks > 0 {
+                        request_queue.extend(picked_blocks.into_iter());
+                    }
+                    requests_left -= num_picked_blocks;
+                } else {
+                    let piece_info = &self.torrent.torrent.pieces[piece_index];
+                    let mut piece_download = PieceDownload::new(piece_index, piece_info.length);
+                    let new_blocks = piece_download.pick_blocks(requests_left);
 
+                    if new_blocks.len() > 0 {
+                        requests_left -= new_blocks.len();
+                        request_queue.extend(new_blocks.into_iter());
+                    }
+                    self.torrent
+                        .downloads
+                        .write()
+                        .await
+                        .insert(piece_index, RwLock::new(piece_download));
+                }
+            }
         }
 
-        todo!()
+        if requests_left > 0 {
+            for piece_download in self.torrent.downloads.write().await.values_mut() {
+                let mut piece_download = piece_download.write().await;
+                if let Some(have) = self.peer.pieces.get(piece_download.index) {
+                    if *have {
+                        let new_blocks = piece_download.pick_blocks(requests_left);
+
+                        if new_blocks.len() > 0 {
+                            requests_left -= new_blocks.len();
+                            request_queue.extend(new_blocks.into_iter());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Make some requests now
+        self.outgoing_requests.extend(request_queue.clone().into_iter());
+        let mut it = futures::stream::iter(request_queue.into_iter().map(|b| Message::Request(b)).map(Ok));
+        sink.send_all(&mut it).await?;
+
+        Ok(())
     }
 }

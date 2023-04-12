@@ -25,22 +25,34 @@ pub struct TorrentContext {
     pub storage: StorageInfo,
     pub info_hash: [u8; 20],
     pub client_id: PeerID,
+    pub piece_picker: RwLock<PiecePicker>,
     pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
-    pub piece_picker: RwLock<PiecePicker>
+    pub torrent: Arc<TorrentInfo>
 }
 
 #[derive(Debug)]
 pub struct PieceDownload {
     pub index: usize,
     pub len: u32,
-    pub blocks: Vec<BlockDownload>
+    pub blocks: Vec<BlockStatus>
 }
 
 impl PieceDownload {
+    pub fn new(piece_index: PieceIndex, len: u32) -> Self {
+        let num_blocks = ((len as f64 / MAX_BLOCK_SIZE as f64) as f64).ceil() as usize;
+        let mut blocks = Vec::with_capacity(num_blocks);
+        blocks.fill_with(Default::default);
+        Self {
+            index: piece_index,
+            len: len,
+            blocks: blocks
+        }
+    }
+
     pub fn free_block(&mut self, block_info: &BlockInfo) {
         let block_index = block_in(self.len, block_info.start);
 
-        self.blocks[block_index] = BlockDownload::Free;
+        self.blocks[block_index] = BlockStatus::Free;
     }
 
     pub fn get_next_block(&self, current_block: &BlockInfo) -> Option<(usize, BlockInfo)> {
@@ -56,15 +68,57 @@ impl PieceDownload {
 
         return Some((block_index, BlockInfo {piece_index: self.index, start: block_start, length: length }))
     }
+
+    pub fn pick_blocks(&mut self, count: usize) -> Vec<BlockInfo> {
+
+        let mut picked = 0;
+        let mut picked_blocks = Vec::with_capacity(count);
+
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+
+            if picked == count {
+                break;
+            }
+            
+            if *block == BlockStatus::Free {
+                let block_info = BlockInfo {
+                        piece_index: self.index,
+                        start: i as u32 * MAX_BLOCK_SIZE,
+                        length: block_len(self.len, i)
+                };
+
+                *block = BlockStatus::Requested;
+
+                picked_blocks.push(block_info);
+                picked += 1;
+                
+            }
+        }
+
+        if picked > 0 {
+            tracing::trace!("Picked {} blocks from piece {}", picked, self.index);
+        } else {
+            tracing::trace!("Cannot pick any blocks from piece {}", self.index);
+        }
+
+        picked_blocks
+    }
 }
 
-fn block_in(piece_length: u32, block_start: u32) -> usize {
-    (((piece_length - block_start) as f32) / peer::MAX_BLOCK_SIZE as f32).ceil() as usize
+pub fn block_in(piece_length: u32, block_offset: u32) -> usize {
+    (((piece_length - block_offset) as f32) / peer::MAX_BLOCK_SIZE as f32).ceil() as usize
+}
+
+fn block_len(piece_len: u32, block_index: usize) -> u32 {
+    let block_index = block_index as u32;
+    let block_offset = block_index * MAX_BLOCK_SIZE;
+    assert!(piece_len > block_offset);
+    std::cmp::min(piece_len - block_offset, MAX_BLOCK_SIZE)
 }
 
 
-#[derive(Debug, Default)]
-pub enum BlockDownload {
+#[derive(Debug, Default, PartialEq)]
+pub enum BlockStatus {
     #[default]
     Free,
     Requested,
@@ -78,7 +132,7 @@ pub struct PieceInfo {
     pub length: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockInfo {
     pub piece_index: usize,
     pub start: u32,
@@ -136,7 +190,7 @@ impl TorrentInfo {
                 length: p_len as u32,
             });
 
-            let num_blocks = ((p_len / block_size as i64) as f64).ceil() as usize;
+            // let num_blocks = ((p_len / block_size as i64) as f64).ceil() as usize;
 
             // let mut tmp_block_len = p_len;
 
@@ -183,18 +237,20 @@ pub struct Torrent {
 
 impl Torrent {
     pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self {
+        let peers = torrent.peers.clone();
 
         let torrent_context = TorrentContext {
             client_id,
             piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
             downloads: Default::default(),
             info_hash: torrent.info_hash,
-            storage: StorageInfo::new(torrent.pieces.len())
+            storage: StorageInfo::new(torrent.pieces.len()),
+            torrent: Arc::new(torrent)
         };
         Self {
             client_id,
             ctx: Arc::new(torrent_context),
-            peers: torrent.peers,
+            peers: peers,
             join_handles: HashMap::new()
         }
     }
