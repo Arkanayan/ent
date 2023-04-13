@@ -3,7 +3,7 @@ use std::{collections::{HashSet, HashMap}, io::Cursor, net::SocketAddr, sync::Ar
 use bytes::{Buf, Bytes};
 use tokio::{sync::{RwLock, mpsc}, task::JoinHandle};
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, trace};
 
 use crate::{
     metainfo::{self, MetaInfo, PeerID},
@@ -40,8 +40,7 @@ pub struct PieceDownload {
 impl PieceDownload {
     pub fn new(piece_index: PieceIndex, len: u32) -> Self {
         let num_blocks = ((len as f64 / MAX_BLOCK_SIZE as f64) as f64).ceil() as usize;
-        let mut blocks = Vec::with_capacity(num_blocks);
-        blocks.fill_with(Default::default);
+        let blocks = vec![BlockStatus::Free; num_blocks];
         Self {
             index: piece_index,
             len: len,
@@ -50,7 +49,7 @@ impl PieceDownload {
     }
 
     pub fn free_block(&mut self, block_info: &BlockInfo) {
-        let block_index = block_in(self.len, block_info.start);
+        let block_index = block_info.index_in_piece();
 
         self.blocks[block_index] = BlockStatus::Free;
     }
@@ -61,7 +60,7 @@ impl PieceDownload {
             return None;
         }
 
-        let block_index = block_in(self.len, current_block.start);
+        let block_index = current_block.index_in_piece();
         if block_index > self.blocks.len() { return None };
         let block_start = block_index as u32 * MAX_BLOCK_SIZE;
         let length = (self.len - block_start).min(MAX_BLOCK_SIZE);
@@ -69,8 +68,18 @@ impl PieceDownload {
         return Some((block_index, BlockInfo {piece_index: self.index, start: block_start, length: length }))
     }
 
-    pub fn pick_blocks(&mut self, count: usize) -> Vec<BlockInfo> {
+    pub fn received_block(&mut self, block_info: &BlockInfo) -> BlockStatus {
+        let index = block_info.index_in_piece();
 
+        let mut block = &mut self.blocks[index];
+        let prev_status = *block;
+        *block = BlockStatus::Received;
+
+        return prev_status;
+    }
+
+    pub fn pick_blocks(&mut self, count: usize) -> Vec<BlockInfo> {
+        trace!("Trying to pick {} blocks of total {}", count, self.blocks.len());
         let mut picked = 0;
         let mut picked_blocks = Vec::with_capacity(count);
 
@@ -81,6 +90,7 @@ impl PieceDownload {
             }
             
             if *block == BlockStatus::Free {
+                trace!("Found free block {}", i);
                 let block_info = BlockInfo {
                         piece_index: self.index,
                         start: i as u32 * MAX_BLOCK_SIZE,
@@ -105,9 +115,6 @@ impl PieceDownload {
     }
 }
 
-pub fn block_in(piece_length: u32, block_offset: u32) -> usize {
-    (((piece_length - block_offset) as f32) / peer::MAX_BLOCK_SIZE as f32).ceil() as usize
-}
 
 fn block_len(piece_len: u32, block_index: usize) -> u32 {
     let block_index = block_index as u32;
@@ -117,7 +124,7 @@ fn block_len(piece_len: u32, block_index: usize) -> u32 {
 }
 
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub enum BlockStatus {
     #[default]
     Free,
@@ -142,6 +149,12 @@ pub struct BlockInfo {
 impl BlockInfo {
     pub fn piece_index(&self) -> PieceIndex {
         self.piece_index
+    }
+
+    pub fn index_in_piece(&self) -> usize {
+        debug_assert!(self.length <= MAX_BLOCK_SIZE);
+        debug_assert!(self.length > 0);
+        (self.start / MAX_BLOCK_SIZE) as usize
     }
 }
 
