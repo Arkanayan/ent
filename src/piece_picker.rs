@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Weak};
 
+use tracing::trace;
+
 use crate::{messages::BitField, units::PieceIndex, torrent::PieceInfo};
 
 #[derive(Debug)]
@@ -72,14 +74,19 @@ impl PiecePicker {
 	}
 
     pub fn pick_piece(&mut self, peer_pieces: &BitField) -> Option<PieceIndex> {
-        for next_piece_index in (peer_pieces.clone() & !self.own_pieces.clone()).iter_ones() {
-			let piece = &mut self.pieces[next_piece_index];
+        for piece_index in  self.own_pieces.iter_zeros() {
+            if let Some(h ) = peer_pieces.get(piece_index) {
+                if !*h {
+                    continue;
+                }
+            }
+			let piece = &mut self.pieces[piece_index];
 			if piece.is_pending {
 				continue;
 			} else {
 				piece.is_pending = true;
 				self.free_count -= 1;
-				return Some(next_piece_index);
+				return Some(piece_index);
 			}
 		}
 		return None;

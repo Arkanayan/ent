@@ -286,7 +286,7 @@ impl Torrent {
         // }
 
 
-        const TOTAL_PEERS: usize = 2;
+        const TOTAL_PEERS: usize = 1;
 
         let peers_to_connect = self.peers.drain(0..self.peers.len().min(TOTAL_PEERS)).collect::<Vec<_>>();
 
