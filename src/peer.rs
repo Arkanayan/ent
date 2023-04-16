@@ -18,10 +18,10 @@ use tracing::{debug, info, trace};
 use crate::{
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
     metainfo::{MetaInfo, PeerID},
-    torrent::{BlockData, BlockInfo, BlockStatus, PieceDownload, TorrentContext, TorrentInfo},
-    tracker::TrackerData,
+    torrent::{BlockData, BlockInfo, TorrentContext, TorrentInfo},
+    tracker::TrackerData, download::{BlockStatus, PieceDownload},
 };
-pub const MAX_BLOCK_SIZE: u32 = 1 << 14;
+
 
 #[derive(Debug, Default, PartialEq)]
 pub enum ConnectionState {
