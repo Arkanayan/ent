@@ -1,6 +1,7 @@
 use std::{collections::{HashSet, HashMap}, io::Cursor, net::SocketAddr, sync::Arc, default};
 
 use bytes::{Buf, Bytes};
+use futures::channel::mpsc::unbounded;
 use tokio::{sync::{RwLock, mpsc}, task::JoinHandle};
 use anyhow::Result;
 use tracing::{info, trace};
@@ -134,10 +135,11 @@ impl TorrentInfo {
 }
 
 type Sender = mpsc::UnboundedSender<Command>;
-type Receiver = mpsc::UnboundedSender<Command>;
+type Receiver = mpsc::UnboundedReceiver<Command>;
 
 pub enum Command {
-    PeerDisconnected { addr: SocketAddr}
+    PeerDisconnected { addr: SocketAddr},
+    PieceCompletion { piece_index: u32 }
 }
 
 pub struct Torrent {
@@ -148,42 +150,33 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self {
+    pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self  {
         let peers = torrent.peers.clone();
-
+        let num_pieces = torrent.pieces.len();
+        let piece_len = torrent.metainfo.info.piece_length;
+        let last_piece_len = torrent.metainfo.torrent_len() - piece_len as u64 * (num_pieces - 1) as u64;
+        let last_piece_len = last_piece_len as u32;
         let torrent_context = TorrentContext {
             client_id,
             piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
             downloads: Default::default(),
             info_hash: torrent.info_hash,
-            storage: StorageInfo::new(torrent.pieces.len()),
+            storage: StorageInfo {
+                piece_count: num_pieces,
+                piece_len: torrent.metainfo.info.piece_length,
+                last_piece_len: last_piece_len
+            },
             torrent: Arc::new(torrent)
         };
         Self {
             client_id,
             ctx: Arc::new(torrent_context),
             peers: peers,
-            join_handles: HashMap::new()
+            join_handles: HashMap::new(),
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
-
-        // let mut pieces = Vec::with_capacity(self.torrent.pieces.len());
-        // let num_pieces = pieces.len();
-        // for p in &self.torrent.pieces {
-        //     let piece_index = p.index;
-
-        //     let num_blocks = ((p.length as i32 / MAX_BLOCK_SIZE as i32) as f32).ceil() as usize;
-
-        //     let mut blocks = Vec::with_capacity(num_blocks);
-
-        //     for i in 0..num_blocks {
-        //         blocks.push(BlockDownload{ piece_index: piece_index, index: i, state: DownloadState::Free});
-        //     }
-        //     pieces.push(PieceDownload{index: piece_index, len: p.length, blocks: blocks});
-        // }
-
 
         const TOTAL_PEERS: usize = 2;
 

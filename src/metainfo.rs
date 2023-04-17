@@ -15,7 +15,7 @@ pub struct Node(String, i64);
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct File {
     pub path: Vec<String>,
-    pub length: i64,
+    pub length: u64,
     #[serde(default)]
     pub md5sum: Option<String>,
 }
@@ -25,7 +25,7 @@ pub struct Info {
     pub name: String,
     pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
-    pub piece_length: i64,
+    pub piece_length: u32,
     #[serde(default)]
     pub md5sum: Option<String>,
     #[serde(default)]
@@ -81,6 +81,15 @@ impl MetaInfo {
         let result = hasher.finalize();
         result.into()
     }
+
+    pub fn torrent_len(&self) -> u64 {
+        if let Some(files) = self.info.files {
+            return files.iter().map(|f| f.length).sum();
+        }
+
+        self.info.length.unwrap() as u64
+    }
+
 }
 
 pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {

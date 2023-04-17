@@ -1,11 +1,7 @@
 
 #[derive(Debug)]
 pub struct StorageInfo {
-	pub piece_count: usize
-}
-
-impl StorageInfo {
-    pub fn new(piece_count: usize) -> Self {
-		Self { piece_count }
-	}
+	pub piece_count: usize,
+	pub piece_len: u32,
+	pub last_piece_len: u32,
 }

@@ -18,6 +18,7 @@ mod piece_picker;
 mod storage;
 mod units;
 mod download;
+mod disk;
 
 
 static PEER_ID: Lazy<metainfo::PeerID> = Lazy::new(|| {
