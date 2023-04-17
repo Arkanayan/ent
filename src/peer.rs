@@ -18,7 +18,7 @@ use tracing::{debug, info, trace};
 use crate::{
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
     metainfo::{MetaInfo, PeerID},
-    torrent::{BlockData, BlockInfo, TorrentContext, TorrentInfo},
+    torrent::{BlockData, BlockInfo, TorrentContext, Receiver},
     tracker::TrackerData, download::{BlockStatus, PieceDownload},
 };
 
@@ -41,6 +41,7 @@ pub struct PeerSession {
     pub outgoing_requests: HashSet<BlockInfo>,
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
+    cmd_rx: Receiver
 }
 
 #[derive(Debug)]
@@ -80,7 +81,7 @@ impl Default for SessionState {
 }
 
 impl PeerSession {
-    pub fn new(torrent_context: Arc<TorrentContext>, addr: SocketAddr) -> Self {
+    pub fn new(torrent_context: Arc<TorrentContext>, addr: SocketAddr, cmd_rx: Receiver) -> Self {
         let piece_count = torrent_context.storage.piece_count;
         PeerSession {
             peer: PeerInfo {
@@ -93,19 +94,11 @@ impl PeerSession {
             torrent: torrent_context,
             state: Default::default(),
             log_target: format!("{}", addr),
+            cmd_rx: cmd_rx
         }
     }
 
     pub async fn start_connection(&mut self) -> Result<()> {
-        // let ip = tracker_data.peers[1].ip.clone();
-        // let port = tracker_data.peers[1].port.clone();
-
-        // info!("Connecting to ({},{})", ip, port);
-        // let addresses = tracker_data.peers.iter().map(|p| (p.ip.clone(), p.port.clone()).into()).collect::<Vec<_>>();
-        // info!("Peers found: {:?}", addresses);
-        // let socket = TcpStream::connect(addresses.as_slice()).await?;
-        // // let socket = TcpStream::connect((ip, port)).await?;
-        // info!("TCP Socket Connected");
         info!("Connecting to {}", self.peer.addr);
 
         let socket = TcpStream::connect(self.peer.addr).await?;
@@ -389,13 +382,6 @@ impl PeerSession {
             if self.state.is_interested && self.outgoing_requests.len() < 8 {
                 self.make_requests(sink).await?;
             }
-            // } else {
-            //     let piece_picker = self.torrent.piece_picker.read().await;
-            //     free_count = piece_picker.free_count;
-            // }
-            // if free_count > 0 {
-            //     self.update_interest(sink, true).await?;
-            // }
         }
         Ok(())
     }
@@ -463,17 +449,6 @@ impl PeerSession {
                 .await
                 .pick_piece(&self.peer.pieces)
             {
-                // if let Some(piece_download_guard) =
-                //     self.torrent.downloads.write().await.get_mut(&piece_index)
-                // {
-                //     let mut piece_download = piece_download_guard.write().await;
-                //     let picked_blocks = piece_download.pick_blocks(requests_left);
-                //     let num_picked_blocks = picked_blocks.len();
-                //     if num_picked_blocks > 0 {
-                //         request_queue.extend(picked_blocks.into_iter());
-                //     }
-                //     requests_left -= num_picked_blocks;
-                // } else {
                 let piece_info = &self.torrent.torrent.pieces[piece_index];
                 let mut piece_download = PieceDownload::new(piece_index, piece_info.length);
                 let new_blocks = piece_download.pick_blocks(requests_left);
@@ -487,7 +462,6 @@ impl PeerSession {
                     .write()
                     .await
                     .insert(piece_index, RwLock::new(piece_download));
-                // }
             } else {
                 break;
             }

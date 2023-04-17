@@ -1,15 +1,31 @@
-use std::{collections::{HashSet, HashMap}, io::Cursor, net::SocketAddr, sync::Arc, default};
+use std::{
+    collections::{HashMap, HashSet},
+    default,
+    io::Cursor,
+    net::SocketAddr,
+    sync::Arc,
+};
 
+use anyhow::Result;
 use bytes::{Buf, Bytes};
 use futures::channel::mpsc::unbounded;
-use tokio::{sync::{RwLock, mpsc}, task::JoinHandle};
-use anyhow::Result;
+use tokio::{
+    sync::{
+        mpsc::{self, unbounded_channel},
+        RwLock,
+    },
+    task::JoinHandle,
+};
 use tracing::{info, trace};
 
 use crate::{
+    download::{PieceDownload, BLOCK_LEN},
     metainfo::{self, MetaInfo, PeerID},
-    tracker::TrackerData, peer::{self, PeerSession}, piece_picker::{PiecePicker, Piece},
-    storage::StorageInfo, units::PieceIndex, download::{PieceDownload, BLOCK_LEN}
+    peer::{self, PeerSession},
+    piece_picker::{Piece, PiecePicker},
+    storage::StorageInfo,
+    tracker::TrackerData,
+    units::PieceIndex,
 };
 
 #[derive(Debug)]
@@ -20,7 +36,6 @@ pub struct TorrentInfo {
     pub metainfo: MetaInfo,
 }
 
-
 #[derive(Debug)]
 pub struct TorrentContext {
     pub storage: StorageInfo,
@@ -28,9 +43,8 @@ pub struct TorrentContext {
     pub client_id: PeerID,
     pub piece_picker: RwLock<PiecePicker>,
     pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
-    pub torrent: Arc<TorrentInfo>
+    pub torrent: Arc<TorrentInfo>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct PieceInfo {
@@ -75,24 +89,17 @@ impl TorrentInfo {
             (length as f32 / meta_info.info.piece_length as f32).ceil() as usize,
             num_pieces
         );
-        // debug_assert_eq!((length / meta_info.info.piece_length)f32).ceil() as usize, num_pieces);
 
         let mut pieces = Vec::with_capacity(num_pieces);
-        // let mut blocks = Vec::new();
 
         let mut temp_sha1 = Cursor::new(&meta_info.info.pieces);
-
-        let mut tmp_length = length;
-        let block_size = 2u64.pow(14);
 
         for index in 0..num_pieces {
             let mut piece_sha1 = [0u8; 20];
             temp_sha1.copy_to_slice(&mut piece_sha1);
 
-            tmp_length = tmp_length - piece_length;
-
-            let p_len = if tmp_length < piece_length {
-                tmp_length
+            let p_len = if index == (num_pieces - 1) {
+                (length - ((num_pieces - 1) as u32 * piece_length) as i64) as u32
             } else {
                 piece_length
             };
@@ -100,31 +107,10 @@ impl TorrentInfo {
             pieces.push(PieceInfo {
                 index: index,
                 sha1: piece_sha1,
-                length: p_len as u32,
+                length: p_len,
             });
+        }
 
-            // let num_blocks = ((p_len / block_size as i64) as f64).ceil() as usize;
-
-            // let mut tmp_block_len = p_len;
-
-            // for block_index in 0..num_blocks {
-            //     tmp_block_len = tmp_block_len - block_size as i64;
-
-            //     let current_block_size = if tmp_block_len < block_size as i64 {
-            //         tmp_block_len
-            //     } else {
-            //         block_size as i64
-            //     };
-
-            //     let offset = block_size * block_index as u64;
-
-            //     blocks.push(BlockInfo {
-            //         piece_index: index,
-            //         start: offset as u32,
-            //         length: current_block_size as u32,
-            //     });
-            }
-        // }
         Self {
             info_hash: meta_info.info_hash(),
             pieces: pieces,
@@ -134,62 +120,91 @@ impl TorrentInfo {
     }
 }
 
-type Sender = mpsc::UnboundedSender<Command>;
-type Receiver = mpsc::UnboundedReceiver<Command>;
+pub type Sender = mpsc::UnboundedSender<Command>;
+pub type Receiver = mpsc::UnboundedReceiver<Command>;
 
 pub enum Command {
-    PeerDisconnected { addr: SocketAddr},
-    PieceCompletion { piece_index: u32 }
+    PeerDisconnected { addr: SocketAddr },
+    PieceCompletion { piece_index: u32 },
+}
+
+pub struct PeerSessionEntry {
+    pub handle: JoinHandle<Result<()>>,
+    pub cmd_tx: Sender,
 }
 
 pub struct Torrent {
     pub client_id: PeerID,
     pub ctx: Arc<TorrentContext>,
-    pub peers: Vec<SocketAddr>,
-    pub join_handles: HashMap<SocketAddr, JoinHandle<Result<()>>>,
+    pub available_peers: Vec<SocketAddr>,
+    pub peer_sessions: HashMap<SocketAddr, PeerSessionEntry>,
 }
 
 impl Torrent {
-    pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self  {
+    pub fn new(torrent: TorrentInfo, client_id: PeerID) -> Self {
         let peers = torrent.peers.clone();
         let num_pieces = torrent.pieces.len();
         let piece_len = torrent.metainfo.info.piece_length;
-        let last_piece_len = torrent.metainfo.torrent_len() - piece_len as u64 * (num_pieces - 1) as u64;
+        let torrent_len = torrent.metainfo.torrent_len();
+        let last_piece_len = torrent_len - piece_len as u64 * (num_pieces - 1) as u64;
         let last_piece_len = last_piece_len as u32;
+
+        let storage_info = StorageInfo {
+            piece_count: num_pieces,
+            piece_len: torrent.metainfo.info.piece_length,
+            last_piece_len: last_piece_len,
+            torrent_len: torrent_len,
+        };
+
         let torrent_context = TorrentContext {
             client_id,
             piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
             downloads: Default::default(),
             info_hash: torrent.info_hash,
-            storage: StorageInfo {
-                piece_count: num_pieces,
-                piece_len: torrent.metainfo.info.piece_length,
-                last_piece_len: last_piece_len
-            },
-            torrent: Arc::new(torrent)
+            torrent: Arc::new(torrent),
+            storage: storage_info,
         };
+
         Self {
             client_id,
             ctx: Arc::new(torrent_context),
-            peers: peers,
-            join_handles: HashMap::new(),
+            available_peers: peers,
+            peer_sessions: HashMap::new(),
         }
     }
 
+    const TOTAL_PEERS: usize = 2;
+
     pub async fn run(&mut self) -> Result<()> {
+        todo!("Implement select! here")
+    }
 
-        const TOTAL_PEERS: usize = 2;
+    pub async fn tick(&mut self) -> Result<()> {
+        todo!()
+    }
 
-        let peers_to_connect = self.peers.drain(0..self.peers.len().min(TOTAL_PEERS)).collect::<Vec<_>>();
-
-        for peer in peers_to_connect {
-            let mut peer_session = PeerSession::new(self.ctx.clone(), peer.clone());
-            let handle = tokio::spawn(async move { peer_session.start_connection().await });
-            self.join_handles.insert(peer.clone(), handle);
+    /// Connect to peers, if any available
+    pub async fn connect_to_peers(&mut self) -> Result<()> {
+        if self.peer_sessions.len() >= Self::TOTAL_PEERS {
+            return Ok(());
         }
 
-        for (addr, handle) in self.join_handles.drain() {
-            handle.await?;
+        if self.available_peers.len() == 0 {
+            return Ok(());
+        }
+
+        let can_connect_to = self.peer_sessions.len().saturating_sub(Self::TOTAL_PEERS);
+
+        // Connect to peers
+        for addr in self
+            .available_peers
+            .drain(..self.available_peers.len().min(Self::TOTAL_PEERS))
+        {
+            let (tx, rx) = unbounded_channel();
+            let mut peer_session = PeerSession::new(self.ctx.clone(), addr.clone(), rx);
+            let handle = tokio::spawn(async move { peer_session.start_connection().await });
+            self.peer_sessions
+                .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });
         }
 
         Ok(())

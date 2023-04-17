@@ -83,7 +83,7 @@ impl MetaInfo {
     }
 
     pub fn torrent_len(&self) -> u64 {
-        if let Some(files) = self.info.files {
+        if let Some(files) = &self.info.files {
             return files.iter().map(|f| f.length).sum();
         }
 
