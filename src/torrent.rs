@@ -4,6 +4,7 @@ use std::{
     io::Cursor,
     net::SocketAddr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -138,6 +139,8 @@ pub struct Torrent {
     pub ctx: Arc<TorrentContext>,
     pub available_peers: Vec<SocketAddr>,
     pub peer_sessions: HashMap<SocketAddr, PeerSessionEntry>,
+    pub start_time: Option<Instant>,
+    pub run_duration: Duration,
 }
 
 impl Torrent {
@@ -170,43 +173,53 @@ impl Torrent {
             ctx: Arc::new(torrent_context),
             available_peers: peers,
             peer_sessions: HashMap::new(),
+            start_time: None,
+            run_duration: Default::default(),
         }
     }
 
-    const TOTAL_PEERS: usize = 2;
+    const MAX_PEERS_COUNT: usize = 2;
+
+    pub async fn start(&mut self) -> Result<()> {
+        self.start_time = Some(Instant::now());
+
+        if let Err(e) = self.run().await {
+            todo!()
+        }
+
+        Ok(())
+    }
 
     pub async fn run(&mut self) -> Result<()> {
         todo!("Implement select! here")
     }
 
-    pub async fn tick(&mut self) -> Result<()> {
-        todo!()
+    pub async fn tick(&mut self, last_tick_time: &mut Option<Instant>, now: Instant) -> Result<()> {
+        let tick_interval = last_tick_time
+            .or(self.start_time)
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or_default();
+        self.run_duration += tick_interval;
+        *last_tick_time = Some(now);
+
+        self.connect_to_peers().await; 
+
+        Ok(())
     }
 
     /// Connect to peers, if any available
-    pub async fn connect_to_peers(&mut self) -> Result<()> {
-        if self.peer_sessions.len() >= Self::TOTAL_PEERS {
-            return Ok(());
-        }
-
-        if self.available_peers.len() == 0 {
-            return Ok(());
-        }
-
-        let can_connect_to = self.peer_sessions.len().saturating_sub(Self::TOTAL_PEERS);
+    async fn connect_to_peers(&mut self) {
+        let can_connect_to = Self::MAX_PEERS_COUNT
+            .saturating_sub(self.peer_sessions.len())
+            .min(self.available_peers.len());
 
         // Connect to peers
-        for addr in self
-            .available_peers
-            .drain(..self.available_peers.len().min(Self::TOTAL_PEERS))
-        {
+        for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
-            let mut peer_session = PeerSession::new(self.ctx.clone(), addr.clone(), rx);
+            let mut peer_session = PeerSession::new(Arc::clone(&self.ctx), addr.clone(), rx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });
         }
-
-        Ok(())
     }
 }
