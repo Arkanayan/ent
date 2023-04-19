@@ -46,7 +46,7 @@ impl PieceDownload {
     pub fn received_block(&mut self, block_info: &BlockInfo) -> BlockStatus {
         let index = block_info.index_in_piece();
 
-        let mut block = &mut self.blocks[index];
+        let block = &mut self.blocks[index];
         let prev_status = *block;
         *block = BlockStatus::Received;
 

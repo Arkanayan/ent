@@ -9,17 +9,19 @@ use std::{
 
 use anyhow::Result;
 use bytes::{Buf, Bytes};
-use futures::channel::mpsc::unbounded;
 use tokio::{
+    select,
     sync::{
         mpsc::{self, unbounded_channel},
         RwLock,
     },
     task::JoinHandle,
+    time::interval,
 };
-use tracing::{info, trace};
+use tracing::{info, trace, debug};
 
 use crate::{
+    disk::{self, BlockWriteError, DiskComm, DiskEntry, DiskStorage},
     download::{PieceDownload, BLOCK_LEN},
     metainfo::{self, MetaInfo, PeerID},
     peer::{self, PeerSession},
@@ -121,12 +123,20 @@ impl TorrentInfo {
     }
 }
 
-pub type Sender = mpsc::UnboundedSender<Command>;
-pub type Receiver = mpsc::UnboundedReceiver<Command>;
+pub type Sender = mpsc::UnboundedSender<Alert>;
+pub type Receiver = mpsc::UnboundedReceiver<Alert>;
 
-pub enum Command {
+pub enum Alert {
     PeerDisconnected { addr: SocketAddr },
-    PieceCompletion { piece_index: u32 },
+}
+
+pub type CommandSender = mpsc::UnboundedSender<Command>;
+pub type CommandReceiver = mpsc::UnboundedReceiver<Command>;
+
+#[derive(Debug)]
+pub enum Command {
+    WriteBlock(BlockInfo, Vec<u8>),
+    Shutdown,
 }
 
 pub struct PeerSessionEntry {
@@ -141,6 +151,7 @@ pub struct Torrent {
     pub peer_sessions: HashMap<SocketAddr, PeerSessionEntry>,
     pub start_time: Option<Instant>,
     pub run_duration: Duration,
+    pub disk: Option<DiskEntry>,
 }
 
 impl Torrent {
@@ -175,26 +186,75 @@ impl Torrent {
             peer_sessions: HashMap::new(),
             start_time: None,
             run_duration: Default::default(),
+            disk: None,
         }
     }
 
     const MAX_PEERS_COUNT: usize = 2;
 
     pub async fn start(&mut self) -> Result<()> {
+        info!("Starting torrent");
+
         self.start_time = Some(Instant::now());
 
+        let (storage, cmd_tx, alert_rx) = DiskStorage::new(
+            self.ctx.torrent.metainfo.info.name.to_owned(),
+            self.ctx.torrent.metainfo.info.pieces.clone().into_vec(),
+            self.ctx.storage.clone(),
+        );
+
+        let handle = tokio::spawn(async move {
+            let _ = storage;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        });
+
+        let disk_entry = DiskEntry {
+            alert_rx: alert_rx,
+            cmd_tx: cmd_tx,
+            handle: handle,
+        };
+
+        self.disk = Some(disk_entry);
+
         if let Err(e) = self.run().await {
-            todo!()
+            return Err(e.into());
         }
 
         Ok(())
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        todo!("Implement select! here")
+    async fn run(&mut self) -> Result<()> {
+        let mut ticker = interval(Duration::from_secs(1));
+
+        let mut last_tick_time = None;
+
+        debug_assert!(
+            self.disk.is_some(),
+            "Disk thread should be started before calling run"
+        );
+
+        use disk::Alert::*;
+        loop {
+            select! {
+                    tick_time = ticker.tick() => {
+                        self.tick(&mut last_tick_time, tick_time.into_std()).await?;
+                    }
+                    Some(cmd) = self.disk.as_mut().unwrap().alert_rx.recv() => {
+                        match cmd {
+                            BlockWriteError(_, _) => todo!(),
+                            PieceCompletion(index) => {
+                                self.handle_piece_completion(index).await?;
+                            }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    pub async fn tick(&mut self, last_tick_time: &mut Option<Instant>, now: Instant) -> Result<()> {
+    async fn tick(&mut self, last_tick_time: &mut Option<Instant>, now: Instant) -> Result<()> {
         let tick_interval = last_tick_time
             .or(self.start_time)
             .map(|t| now.saturating_duration_since(t))
@@ -202,8 +262,13 @@ impl Torrent {
         self.run_duration += tick_interval;
         *last_tick_time = Some(now);
 
-        self.connect_to_peers().await; 
+        self.connect_to_peers().await;
 
+        Ok(())
+    }
+
+    async fn handle_piece_completion(&mut self, index: PieceIndex) -> Result<()> {
+        debug!("Completed piece: {}", index);
         Ok(())
     }
 
@@ -216,7 +281,8 @@ impl Torrent {
         // Connect to peers
         for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
-            let mut peer_session = PeerSession::new(Arc::clone(&self.ctx), addr.clone(), rx);
+            let disk_tx = self.disk.as_ref().map(|d| d.cmd_tx.clone()).unwrap();
+            let mut peer_session = PeerSession::new(Arc::clone(&self.ctx), addr.clone(), rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });

@@ -19,7 +19,7 @@ use crate::{
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
     metainfo::{MetaInfo, PeerID},
     torrent::{BlockData, BlockInfo, TorrentContext, Receiver},
-    tracker::TrackerData, download::{BlockStatus, PieceDownload},
+    tracker::TrackerData, download::{BlockStatus, PieceDownload}, disk::{CommandSender, self},
 };
 
 
@@ -41,7 +41,8 @@ pub struct PeerSession {
     pub outgoing_requests: HashSet<BlockInfo>,
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
-    cmd_rx: Receiver
+    cmd_rx: Receiver,
+    disk_tx: CommandSender
 }
 
 #[derive(Debug)]
@@ -81,7 +82,7 @@ impl Default for SessionState {
 }
 
 impl PeerSession {
-    pub fn new(torrent_context: Arc<TorrentContext>, addr: SocketAddr, cmd_rx: Receiver) -> Self {
+    pub fn new(torrent_context: Arc<TorrentContext>, addr: SocketAddr, cmd_rx: Receiver, disk_tx: CommandSender) -> Self {
         let piece_count = torrent_context.storage.piece_count;
         PeerSession {
             peer: PeerInfo {
@@ -94,7 +95,8 @@ impl PeerSession {
             torrent: torrent_context,
             state: Default::default(),
             log_target: format!("{}", addr),
-            cmd_rx: cmd_rx
+            cmd_rx: cmd_rx,
+            disk_tx: disk_tx
         }
     }
 

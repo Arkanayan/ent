@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     };
 
     let mut torrent = Torrent::new(torrent_info, *PEER_ID);
-    torrent.run().await?;
+    torrent.start().await?;
     // let mut peer_session = PeerSession::new(torrent_info.clone(), peer.clone());
     // peer_session.start_connection(*PEER_ID).await?;
 
