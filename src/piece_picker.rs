@@ -1,8 +1,4 @@
-use std::{collections::HashMap, sync::Weak};
-
-use tracing::trace;
-
-use crate::{messages::BitField, units::PieceIndex, torrent::PieceInfo};
+use crate::{messages::BitField, units::PieceIndex};
 
 #[derive(Debug)]
 pub struct PiecePicker {

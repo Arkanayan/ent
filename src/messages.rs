@@ -1,9 +1,9 @@
 use anyhow::anyhow;
 use bitvec::prelude::{BitVec, Msb0};
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut};
 use std::io;
-use std::io::{prelude::*, Cursor};
-use tokio::io::AsyncReadExt;
+use std::io::{Cursor};
+
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::metainfo::PeerID;

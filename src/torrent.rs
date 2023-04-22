@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    default,
+    collections::HashMap,
     io::Cursor,
     net::SocketAddr,
     sync::Arc,
@@ -18,14 +17,14 @@ use tokio::{
     task::JoinHandle,
     time::interval,
 };
-use tracing::{info, trace, debug};
+use tracing::{debug, info};
 
 use crate::{
-    disk::{self, BlockWriteError, DiskComm, DiskEntry, DiskStorage},
+    disk::{self, DiskEntry, DiskStorage},
     download::{PieceDownload, BLOCK_LEN},
-    metainfo::{self, MetaInfo, PeerID},
+    metainfo::{MetaInfo, PeerID},
     peer::{self, PeerSession},
-    piece_picker::{Piece, PiecePicker},
+    piece_picker::PiecePicker,
     storage::StorageInfo,
     tracker::TrackerData,
     units::PieceIndex,
@@ -152,6 +151,8 @@ pub struct Torrent {
     pub start_time: Option<Instant>,
     pub run_duration: Duration,
     pub disk: Option<DiskEntry>,
+    /// Num Pieces we have
+    pieces_count: usize
 }
 
 impl Torrent {
@@ -187,10 +188,11 @@ impl Torrent {
             start_time: None,
             run_duration: Default::default(),
             disk: None,
+            pieces_count: 0
         }
     }
 
-    const MAX_PEERS_COUNT: usize = 2;
+    const MAX_PEERS_COUNT: usize = 8;
 
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting torrent");
@@ -203,9 +205,7 @@ impl Torrent {
             self.torrent.storage.clone(),
         );
 
-        let handle = tokio::spawn(async move {
-            storage.start().await
-        });
+        let handle = tokio::spawn(async move { storage.start().await });
 
         let disk_entry = DiskEntry {
             alert_rx: alert_rx,
@@ -247,7 +247,7 @@ impl Torrent {
                             PieceHashMismatch(index) => {
                                 self.handle_piece_hash_mismatch(index).await;
                             }
-                            
+
                     }
                 }
             }
@@ -275,15 +275,28 @@ impl Torrent {
 
         self.torrent.downloads.write().await.remove(&index);
 
-        self.torrent.piece_picker.write().await.register_failed_piece(index);
+        self.torrent
+            .piece_picker
+            .write()
+            .await
+            .register_failed_piece(index);
     }
 
     async fn handle_piece_completion(&mut self, index: PieceIndex) -> Result<()> {
         info!("Completed piece: {}", index);
 
+        self.pieces_count += 1;
+
+        let percent_complete = (self.pieces_count as f32 / self.torrent.storage.piece_count as f32) as f32 * 100f32;
+        info!("We have {}/{} {:.2}%", self.pieces_count, self.torrent.storage.piece_count, percent_complete);
+
         self.torrent.downloads.write().await.remove(&index);
 
-        self.torrent.piece_picker.write().await.received_piece(index);
+        self.torrent
+            .piece_picker
+            .write()
+            .await
+            .received_piece(index);
 
         // Inform all peers
         for p in self.peer_sessions.values_mut() {
@@ -302,7 +315,8 @@ impl Torrent {
         for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
             let disk_tx = self.disk.as_ref().map(|d| d.cmd_tx.clone()).unwrap();
-            let mut peer_session = PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
+            let mut peer_session =
+                PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });

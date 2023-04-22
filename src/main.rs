@@ -1,9 +1,9 @@
-use std::sync::Arc;
+
 
 use anyhow::Result;
-use tracing::info;
-use once_cell::sync::{OnceCell, Lazy};
-use peer::PeerSession;
+
+use once_cell::sync::{Lazy};
+
 use rand::{thread_rng, distributions::Alphanumeric, Rng, seq::SliceRandom};
 use torrent::{TorrentInfo, Torrent};
 
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     let torrent_info = TorrentInfo::new(&meta_info, &tracker_data);
 
-    let peer = if let Some(p) = torrent_info.peers.choose(&mut rand::thread_rng()) {
+    let _peer = if let Some(p) = torrent_info.peers.choose(&mut rand::thread_rng()) {
         p
     } else {
         return Err(anyhow::anyhow!("No peers found"));

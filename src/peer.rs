@@ -1,16 +1,14 @@
 use std::{
     collections::HashSet,
-    hash::Hash,
     iter::Extend,
     net::SocketAddr,
-    ops::Index,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Ok, Result};
 use bitvec::macros::internal::funty::Integral;
-use futures::{executor::block_on, stream::SplitSink, SinkExt, StreamExt};
+use futures::{stream::SplitSink, SinkExt, StreamExt};
 use tokio::{
     net::TcpStream,
     sync::{
@@ -24,11 +22,10 @@ use tracing::{debug, info, trace};
 
 use crate::{
     disk::{self, CommandSender},
-    download::{BlockStatus, PieceDownload},
+    download::{PieceDownload},
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
-    metainfo::{MetaInfo, PeerID},
-    torrent::{BlockData, BlockInfo, TorrentContext},
-    tracker::TrackerData,
+    metainfo::{PeerID},
+    torrent::{BlockInfo, TorrentContext},
     units::PieceIndex,
 };
 
@@ -176,7 +173,7 @@ impl PeerSession {
         self.run(socket).await
     }
 
-    pub async fn run(&mut self, mut socket: Framed<TcpStream, MessageCodec>) -> Result<()> {
+    pub async fn run(&mut self, socket: Framed<TcpStream, MessageCodec>) -> Result<()> {
         let (mut sink, mut stream) = socket.split();
 
         // tis the time to send bitfield
@@ -413,9 +410,9 @@ impl PeerSession {
     async fn handle_tick(
         &mut self,
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
-        instant: Instant,
+        _instant: Instant,
     ) -> Result<()> {
-        let mut free_count = 0;
+        let _free_count = 0;
         if !self.state.is_choked {
             if self.state.is_interested && self.outgoing_requests.len() < 8 {
                 self.make_requests(sink).await?;

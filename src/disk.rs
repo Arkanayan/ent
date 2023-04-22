@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use anyhow::Result;
-use futures::executor::block_on;
+
 use sha1::{Digest, Sha1};
-use sha1::digest::block_buffer::Block;
-use tokio::io::AsyncSeekExt;
+
+
 use tokio::sync::mpsc::{
-    unbounded_channel, UnboundedReceiver, UnboundedSender, WeakUnboundedSender,
+    unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio::task::{JoinHandle, spawn_blocking};
-use tokio::{fs, select};
-use tracing::{debug, info, trace};
+use tokio::{select};
+use tracing::{debug, trace};
 
 use crate::units::block_count;
 use crate::{storage::StorageInfo, torrent::BlockInfo, units::PieceIndex};
