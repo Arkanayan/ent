@@ -112,6 +112,11 @@ impl PiecePicker {
             self.free_count -= 1;
             piece.is_pending = false;
         }
+    }
 
+    pub fn register_failed_piece(&mut self, index: PieceIndex) {
+        self.own_pieces.set(index, false);
+        self.pieces[index].is_pending = false;
+        self.free_count -= 1;
     }
 }

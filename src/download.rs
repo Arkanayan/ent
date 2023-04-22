@@ -40,7 +40,7 @@ impl PieceDownload {
         let block_start = block_index as u32 * BLOCK_LEN;
         let length = (self.len - block_start).min(BLOCK_LEN);
 
-        return Some((block_index, BlockInfo {piece_index: self.index, start: block_start, length: length }))
+        return Some((block_index, BlockInfo {piece_index: self.index, offset: block_start, length: length }))
     }
 
     pub fn received_block(&mut self, block_info: &BlockInfo) -> BlockStatus {
@@ -68,7 +68,7 @@ impl PieceDownload {
                 trace!("Found free block {}", i);
                 let block_info = BlockInfo {
                         piece_index: self.index,
-                        start: i as u32 * BLOCK_LEN,
+                        offset: i as u32 * BLOCK_LEN,
                         length: block_len(self.len, i)
                 };
 

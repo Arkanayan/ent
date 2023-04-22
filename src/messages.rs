@@ -212,7 +212,7 @@ impl Encoder<Message> for MessageCodec {
             }
             Request(BlockInfo {
                 piece_index,
-                start,
+                offset: start,
                 length,
             }) => {
                 let msg_len = 1 + 4 + 4 + 4;
@@ -238,7 +238,7 @@ impl Encoder<Message> for MessageCodec {
             }
             Cancel(BlockInfo {
                 piece_index,
-                start,
+                offset: start,
                 length,
             }) => {
                 let msg_len = 1 + 4 + 4 + 4;
@@ -322,7 +322,7 @@ impl Decoder for MessageCodec {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 Message::Request(BlockInfo {
                     piece_index: piece_index,
-                    start: begin,
+                    offset: begin,
                     length: length,
                 })
             }
@@ -351,7 +351,7 @@ impl Decoder for MessageCodec {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 Message::Cancel(BlockInfo {
                     piece_index: piece_index,
-                    start: begin,
+                    offset: begin,
                     length: length,
                 })
             }

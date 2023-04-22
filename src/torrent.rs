@@ -59,7 +59,7 @@ pub struct PieceInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockInfo {
     pub piece_index: usize,
-    pub start: u32,
+    pub offset: u32,
     pub length: u32,
 }
 
@@ -71,7 +71,7 @@ impl BlockInfo {
     pub fn index_in_piece(&self) -> usize {
         debug_assert!(self.length <= BLOCK_LEN);
         debug_assert!(self.length > 0);
-        (self.start / BLOCK_LEN) as usize
+        (self.offset / BLOCK_LEN) as usize
     }
 }
 
@@ -141,12 +141,12 @@ pub enum Command {
 
 pub struct PeerSessionEntry {
     pub handle: JoinHandle<Result<()>>,
-    pub cmd_tx: Sender,
+    pub cmd_tx: peer::Sender,
 }
 
 pub struct Torrent {
     pub client_id: PeerID,
-    pub ctx: Arc<TorrentContext>,
+    pub torrent: Arc<TorrentContext>,
     pub available_peers: Vec<SocketAddr>,
     pub peer_sessions: HashMap<SocketAddr, PeerSessionEntry>,
     pub start_time: Option<Instant>,
@@ -181,7 +181,7 @@ impl Torrent {
 
         Self {
             client_id,
-            ctx: Arc::new(torrent_context),
+            torrent: Arc::new(torrent_context),
             available_peers: peers,
             peer_sessions: HashMap::new(),
             start_time: None,
@@ -198,15 +198,13 @@ impl Torrent {
         self.start_time = Some(Instant::now());
 
         let (storage, cmd_tx, alert_rx) = DiskStorage::new(
-            self.ctx.torrent.metainfo.info.name.to_owned(),
-            self.ctx.torrent.metainfo.info.pieces.clone().into_vec(),
-            self.ctx.storage.clone(),
+            self.torrent.torrent.metainfo.info.name.to_owned(),
+            self.torrent.torrent.metainfo.info.pieces.clone().into_vec(),
+            self.torrent.storage.clone(),
         );
 
         let handle = tokio::spawn(async move {
-            let _ = storage;
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            Ok(())
+            storage.start().await
         });
 
         let disk_entry = DiskEntry {
@@ -245,7 +243,11 @@ impl Torrent {
                             BlockWriteError(_, _) => todo!(),
                             PieceCompletion(index) => {
                                 self.handle_piece_completion(index).await?;
+                            },
+                            PieceHashMismatch(index) => {
+                                self.handle_piece_hash_mismatch(index).await;
                             }
+                            
                     }
                 }
             }
@@ -267,8 +269,26 @@ impl Torrent {
         Ok(())
     }
 
+    async fn handle_piece_hash_mismatch(&mut self, index: PieceIndex) {
+        debug!("Piece Hash Mismatch, Index: {}", index);
+        //TODO: Put the participating peers in parole
+
+        self.torrent.downloads.write().await.remove(&index);
+
+        self.torrent.piece_picker.write().await.register_failed_piece(index);
+    }
+
     async fn handle_piece_completion(&mut self, index: PieceIndex) -> Result<()> {
-        debug!("Completed piece: {}", index);
+        info!("Completed piece: {}", index);
+
+        self.torrent.downloads.write().await.remove(&index);
+
+        self.torrent.piece_picker.write().await.received_piece(index);
+
+        // Inform all peers
+        for p in self.peer_sessions.values_mut() {
+            p.cmd_tx.send(peer::Command::PieceCompletion(index)).ok();
+        }
         Ok(())
     }
 
@@ -282,7 +302,7 @@ impl Torrent {
         for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
             let disk_tx = self.disk.as_ref().map(|d| d.cmd_tx.clone()).unwrap();
-            let mut peer_session = PeerSession::new(Arc::clone(&self.ctx), addr.clone(), rx, disk_tx);
+            let mut peer_session = PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });

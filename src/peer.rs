@@ -11,17 +11,26 @@ use std::{
 use anyhow::{anyhow, Ok, Result};
 use bitvec::macros::internal::funty::Integral;
 use futures::{executor::block_on, stream::SplitSink, SinkExt, StreamExt};
-use tokio::{net::TcpStream, sync::RwLock, time};
+use tokio::{
+    net::TcpStream,
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        RwLock,
+    },
+    time,
+};
 use tokio_util::codec::{Framed, FramedParts};
 use tracing::{debug, info, trace};
 
 use crate::{
+    disk::{self, CommandSender},
+    download::{BlockStatus, PieceDownload},
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
     metainfo::{MetaInfo, PeerID},
-    torrent::{BlockData, BlockInfo, TorrentContext, Receiver},
-    tracker::TrackerData, download::{BlockStatus, PieceDownload}, disk::{CommandSender, self},
+    torrent::{BlockData, BlockInfo, TorrentContext},
+    tracker::TrackerData,
+    units::PieceIndex,
 };
-
 
 #[derive(Debug, Default, PartialEq)]
 pub enum ConnectionState {
@@ -33,6 +42,14 @@ pub enum ConnectionState {
     Connected,
 }
 
+#[derive(Debug)]
+pub enum Command {
+    PieceCompletion(PieceIndex),
+    Shutdown,
+}
+
+pub(crate) type Sender = UnboundedSender<Command>;
+type Receiver = UnboundedReceiver<Command>;
 
 #[derive(Debug)]
 pub struct PeerSession {
@@ -42,7 +59,7 @@ pub struct PeerSession {
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
     cmd_rx: Receiver,
-    disk_tx: CommandSender
+    disk_tx: CommandSender,
 }
 
 #[derive(Debug)]
@@ -82,7 +99,12 @@ impl Default for SessionState {
 }
 
 impl PeerSession {
-    pub fn new(torrent_context: Arc<TorrentContext>, addr: SocketAddr, cmd_rx: Receiver, disk_tx: CommandSender) -> Self {
+    pub fn new(
+        torrent_context: Arc<TorrentContext>,
+        addr: SocketAddr,
+        cmd_rx: Receiver,
+        disk_tx: CommandSender,
+    ) -> Self {
         let piece_count = torrent_context.storage.piece_count;
         PeerSession {
             peer: PeerInfo {
@@ -96,7 +118,7 @@ impl PeerSession {
             state: Default::default(),
             log_target: format!("{}", addr),
             cmd_rx: cmd_rx,
-            disk_tx: disk_tx
+            disk_tx: disk_tx,
         }
     }
 
@@ -173,7 +195,7 @@ impl PeerSession {
         loop {
             tokio::select! {
                 now = tick_timer.tick() => {
-                    info!("Time Ticking");
+                    trace!("Time Ticking");
                     self.handle_tick(&mut sink, now.into_std()).await?;
                 }
                 Some(msg) = stream.next() => {
@@ -193,6 +215,12 @@ impl PeerSession {
                     } else {
                         // info!("Other message. {:?}", msg);
                         self.handle_msg(&mut sink, msg).await?;
+                    }
+                }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    match cmd {
+                        Command::PieceCompletion(index) => self.handle_piece_completion(index).await,
+                        Command::Shutdown => todo!(),
                     }
                 }
             }
@@ -257,26 +285,34 @@ impl PeerSession {
             Message::Piece(block_data) => {
                 let block_info = BlockInfo {
                     piece_index: block_data.piece_index,
-                    start: block_data.offset,
+                    offset: block_data.offset,
                     length: block_data.data.len() as u32,
                 };
                 self.state.total_downloaded_bytes += block_data.data.len() as u64;
 
-                let torrent_size = self.torrent.torrent.metainfo.info.length.unwrap();
-                let percent_downloaded =
-                    (self.state.total_downloaded_bytes as f64 / torrent_size as f64) * 100 as f64;
-                tracing::info!(
-                    "Peer send us piece={} block={} downloaded={}/{} {:.3}%",
-                    block_data.piece_index,
-                    block_info.index_in_piece(),
-                    self.state.total_downloaded_bytes,
-                    torrent_size,
-                    percent_downloaded
-                );
+                // let torrent_size = self.torrent.torrent.metainfo.info.length.unwrap();
+                // let percent_downloaded =
+                //     (self.state.total_downloaded_bytes as f64 / torrent_size as f64) * 100 as f64;
+                // tracing::info!(
+                //     "Peer send us piece={} block={} downloaded={}/{} {:.3}%",
+                //     block_data.piece_index,
+                //     block_info.index_in_piece(),
+                //     self.state.total_downloaded_bytes,
+                //     torrent_size,
+                //     percent_downloaded
+                // );
 
                 self.outgoing_requests.remove(&block_info);
+
+                self.disk_tx
+                    .send(disk::Command::WriteBlock(
+                        block_info.clone(),
+                        block_data.data.into(),
+                    ))
+                    .ok();
+
                 // Notify everyone we got block
-                let mut piece_complete = false;
+                // let mut piece_complete = false;
                 if let Some(piece_download) = self
                     .torrent
                     .downloads
@@ -286,24 +322,24 @@ impl PeerSession {
                 {
                     piece_download.write().await.received_block(&block_info);
 
-                    if piece_download
-                        .read()
-                        .await
-                        .blocks
-                        .iter()
-                        .all(|b| *b == BlockStatus::Received)
-                    {
-                        piece_complete = true;
-                    }
+                    // if piece_download
+                    //     .read()
+                    //     .await
+                    //     .blocks
+                    //     .iter()
+                    //     .all(|b| *b == BlockStatus::Received)
+                    // {
+                    //     piece_complete = true;
+                    // }
                 }
-                if piece_complete {
-                    tracing::info!("Completed piece {}", block_data.piece_index);
-                    self.torrent
-                        .piece_picker
-                        .write()
-                        .await
-                        .received_piece(block_data.piece_index);
-                }
+                // if piece_complete {
+                //     tracing::info!("Completed piece {}", block_data.piece_index);
+                //     self.torrent
+                //         .piece_picker
+                //         .write()
+                //         .await
+                //         .received_piece(block_data.piece_index);
+                // }
 
                 self.make_requests(sink).await?;
             }
@@ -392,7 +428,7 @@ impl PeerSession {
         &mut self,
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
     ) -> Result<()> {
-        info!("Making requests");
+        trace!("Making requests");
 
         if self.state.is_choked {
             debug!("Can't make requests while choked");
@@ -408,7 +444,7 @@ impl PeerSession {
 
         let mut requests_left = REQUEST_QUEUE_SIZE.saturating_sub(self.outgoing_requests.len());
 
-        info!("Can make {} requests", requests_left);
+        trace!("Can make {} requests", requests_left);
 
         if requests_left == 0 {
             return Ok(());
@@ -501,5 +537,9 @@ impl PeerSession {
         sink.send_all(&mut it).await?;
 
         Ok(())
+    }
+
+    async fn handle_piece_completion(&mut self, index: PieceIndex) {
+        self.outgoing_requests.retain(|b| b.piece_index() != index)
     }
 }
