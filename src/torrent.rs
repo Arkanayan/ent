@@ -192,7 +192,7 @@ impl Torrent {
         }
     }
 
-    const MAX_PEERS_COUNT: usize = 8;
+    const MAX_PEERS_COUNT: usize = 2;
 
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting torrent");
