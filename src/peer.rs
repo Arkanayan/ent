@@ -22,9 +22,9 @@ use tracing::{debug, info, trace};
 
 use crate::{
     disk::{self, CommandSender},
-    download::{PieceDownload},
+    download::PieceDownload,
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
-    metainfo::{PeerID},
+    metainfo::PeerID,
     torrent::{BlockInfo, TorrentContext},
     units::PieceIndex,
 };
@@ -217,12 +217,14 @@ impl PeerSession {
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         Command::PieceCompletion(index) => self.handle_piece_completion(index).await,
-                        Command::Shutdown => todo!(),
+                        Command::Shutdown => {
+                            self.handle_shutdown(&mut sink).await?;
+                            return Ok(());
+                        },
                     }
                 }
             }
         }
-        Ok(())
     }
 
     async fn handle_msg(
@@ -538,5 +540,18 @@ impl PeerSession {
 
     async fn handle_piece_completion(&mut self, index: PieceIndex) {
         self.outgoing_requests.retain(|b| b.piece_index() != index)
+    }
+
+    async fn handle_shutdown(
+        &mut self,
+        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
+    ) -> Result<()> {
+        // Send cancel to all pending messages
+
+        for block_info in self.outgoing_requests.drain() {
+            sink.send(Message::Cancel(block_info)).await.ok();
+        }
+
+        Ok(())
     }
 }

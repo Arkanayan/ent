@@ -17,7 +17,7 @@ use tokio::{
     task::JoinHandle,
     time::interval,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::{
     disk::{self, DiskEntry, DiskStorage},
@@ -246,14 +246,18 @@ impl Torrent {
                             },
                             PieceHashMismatch(index) => {
                                 self.handle_piece_hash_mismatch(index).await;
+                            },
+                            TorrentCompletion => {
+                                // Shutdown all operations
+                                self.handle_torrent_completion().await?;
+                                info!("Torrent Completed");
+                                return Ok(());
                             }
 
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn tick(&mut self, last_tick_time: &mut Option<Instant>, now: Instant) -> Result<()> {
@@ -265,6 +269,25 @@ impl Torrent {
         *last_tick_time = Some(now);
 
         self.connect_to_peers().await;
+
+        Ok(())
+    }
+
+    async fn handle_torrent_completion(&mut self) -> Result<()> {
+
+        for sess in self.peer_sessions.values() {
+            sess.cmd_tx.send(peer::Command::Shutdown).ok();
+        }
+
+        for (addr, sess) in self.peer_sessions.drain() {
+            trace!("Peer {} shutdown", addr);
+            sess.handle.await.ok();
+        }
+
+        if let Some(disk) = self.disk.take() {
+            disk.cmd_tx.send(disk::Command::Shutdown).ok();
+            disk.handle.await.ok();
+        }
 
         Ok(())
     }

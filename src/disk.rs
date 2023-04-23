@@ -63,6 +63,7 @@ pub struct DiskStorage {
     pieces: HashMap<PieceIndex, Piece>,
     cmd_rx: CommandReceiver,
     alert_tx: AlertSender,
+    missing_count: usize
 }
 
 impl DiskStorage {
@@ -73,6 +74,7 @@ impl DiskStorage {
     ) -> (Self, CommandSender, AlertReceiver) {
         let (tx, rx) = unbounded_channel();
         let (cmd_tx, cmd_rx) = unbounded_channel();
+        let missing_pieces_count = info.piece_count;
         (
             Self {
                 filename,
@@ -81,6 +83,7 @@ impl DiskStorage {
                 pieces: HashMap::new(),
                 cmd_rx,
                 alert_tx: tx,
+                missing_count: missing_pieces_count
             },
             cmd_tx,
             rx,
@@ -89,25 +92,26 @@ impl DiskStorage {
 
     pub async fn start(mut self) -> Result<()> {
         trace!("Starting Disk Thread");
-        // Create file
         let f = fs::OpenOptions::new().create(true).read(true).write(true).open(&self.filename).await?;
         let mut buf = tokio::io::BufWriter::new(f);
-        // f.seek(io::SeekFrom::Current(self.info.torrent_len as i64)).await?;
 
         loop {
             select! {
                Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         Command::WriteBlock(block_info, bytes) => {
-                            log::info!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
+                            info!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
                             self.write_block(&mut buf, block_info, bytes).await;
                         },
-                        Command::Shutdown => todo!(),
+                        Command::Shutdown => {
+                            info!("Shutting down disk storage");
+                            buf.flush().await.ok();
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
-        Ok(())
     }
 
     async fn write_block<F: AsyncSeek + AsyncWrite + Unpin>(&mut self, file: &mut F,block_info: BlockInfo, data: Vec<u8>) {
@@ -157,16 +161,19 @@ impl DiskStorage {
             }).await.expect("Hash calculation error");
 
             if verified {
-                //TODO: Write to file
+                self.missing_count -= 1;
                 let file_start = piece_index * piece.len as usize;
                 file.seek(io::SeekFrom::Start(file_start as u64)).await.ok();
-                info!("Writing: {}", piece.len/1024);
                 for b in piece.blocks.into_values() {
-                    file.write_all(b.as_slice()).await;
+                    file.write_all(b.as_slice()).await.ok();
                 }
                 alert_tx.send(Alert::PieceCompletion(piece_index)).ok();
             } else {
                 alert_tx.send(Alert::PieceHashMismatch(piece_index)).ok();
+            }
+
+            if self.missing_count == 0 {
+                alert_tx.send(Alert::TorrentCompletion).ok();
             }
 
         }
@@ -191,6 +198,7 @@ pub enum Alert {
     PieceHashMismatch(PieceIndex),
     BlockWriteError(BlockInfo, BlockWriteError),
     PieceCompletion(PieceIndex),
+    TorrentCompletion
 }
 
 #[derive(Debug)]
