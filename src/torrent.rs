@@ -74,7 +74,7 @@ impl BlockInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct BlockData {
     pub piece_index: usize,
     pub offset: u32,
@@ -192,7 +192,7 @@ impl Torrent {
         }
     }
 
-    const MAX_PEERS_COUNT: usize = 2;
+    const MAX_PEERS_COUNT: usize = 8;
 
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting torrent");

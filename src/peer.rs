@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Ok, Result};
-use bitvec::macros::internal::funty::Integral;
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use tokio::{
     net::TcpStream,
@@ -23,10 +22,10 @@ use tracing::{debug, info, trace};
 use crate::{
     disk::{self, CommandSender},
     download::PieceDownload,
-    messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec},
+    messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec, MessageId},
     metainfo::PeerID,
     torrent::{BlockInfo, TorrentContext},
-    units::PieceIndex,
+    units::PieceIndex, stat::ThruputCounters,
 };
 
 #[derive(Debug, Default, PartialEq)]
@@ -50,14 +49,21 @@ type Receiver = UnboundedReceiver<Command>;
 
 #[derive(Debug)]
 pub struct PeerSession {
-    pub log_target: String,
-    pub state: SessionState,
+    pub repr: String,
     pub outgoing_requests: HashSet<BlockInfo>,
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
     cmd_rx: Receiver,
     disk_tx: CommandSender,
+    pub ctx: SessionContext
 }
+
+#[derive(Debug, Default)]
+pub struct SessionContext {
+    pub counters: ThruputCounters,
+    pub state: SessionState
+}
+
 
 #[derive(Debug)]
 pub struct PeerInfo {
@@ -78,8 +84,6 @@ pub struct SessionState {
     pub is_interested: bool,
     // Are we choked by the peer
     pub is_choked: bool,
-    // How many bytes downloaded from this peer
-    pub total_downloaded_bytes: u64,
 }
 
 impl Default for SessionState {
@@ -90,7 +94,6 @@ impl Default for SessionState {
             is_peer_choked: true,
             is_interested: false,
             is_choked: true,
-            total_downloaded_bytes: 0,
         }
     }
 }
@@ -112,10 +115,10 @@ impl PeerSession {
             },
             outgoing_requests: HashSet::new(),
             torrent: torrent_context,
-            state: Default::default(),
-            log_target: format!("{}", addr),
+            repr: format!("{}", addr),
             cmd_rx: cmd_rx,
             disk_tx: disk_tx,
+            ctx: Default::default()
         }
     }
 
@@ -123,10 +126,10 @@ impl PeerSession {
         info!("Connecting to {}", self.peer.addr);
 
         let socket = TcpStream::connect(self.peer.addr).await?;
-        info!(peer = self.log_target, "TCP Socket Connected");
+        info!(peer = self.repr, "TCP Socket Connected");
 
         let socket = Framed::new(socket, HandShakeCodec);
-        self.state.connection = ConnectionState::Handshaking;
+        self.ctx.state.connection = ConnectionState::Handshaking;
 
         self.handle_connection(socket).await
     }
@@ -138,6 +141,8 @@ impl PeerSession {
         let info_hash = self.torrent.info_hash;
         let handshake = HandShake::new(self.torrent.client_id, info_hash);
 
+        self.ctx.counters.protocol.up.add(handshake.len());
+
         socket.send(handshake).await?;
         info!("Handshake sent");
 
@@ -145,9 +150,10 @@ impl PeerSession {
             info!("Packet received from peer. Should be handshake");
 
             let handshake = peer_handshake?;
+            self.ctx.counters.protocol.down.add(handshake.len());
             info!(target: "connection", addr = self.peer.addr.to_string(), "Handshake received");
             log::trace!(
-                target: &self.log_target,
+                target: &self.repr,
                 "Handshake: {:?}, Peer Id: {}",
                 handshake,
                 String::from_utf8_lossy(&handshake.peer_id)
@@ -158,7 +164,7 @@ impl PeerSession {
             }
 
             self.peer.id = Some(handshake.peer_id);
-            self.state.connection = ConnectionState::AvailabilityExchange;
+            self.ctx.state.connection = ConnectionState::AvailabilityExchange;
         }
 
         let old_parts = socket.into_parts();
@@ -182,6 +188,7 @@ impl PeerSession {
             let own_pieces = piece_picker_guard.own_pieces();
             if own_pieces.any() {
                 info!("Sending piece availability");
+                self.ctx.counters.protocol.up.add(MessageId::BitField.header_len() + own_pieces.len() as u64);
                 sink.send(Message::BitField(own_pieces.clone())).await?;
                 info!("Sent piece availability");
             }
@@ -198,7 +205,7 @@ impl PeerSession {
                 Some(msg) = stream.next() => {
                     let msg = msg?;
 
-                    if self.state.connection == ConnectionState::AvailabilityExchange {
+                    if self.ctx.state.connection == ConnectionState::AvailabilityExchange {
                         if let Message::BitField(bitfield) = msg {
                             info!("bitfield message got. {}", bitfield.count_ones());
                             self.handle_bitfield_msg(&mut sink, bitfield).await?;
@@ -207,8 +214,8 @@ impl PeerSession {
                             self.handle_msg(&mut sink, msg).await?;
                         }
 
-                        self.state.connection = ConnectionState::Connected;
-                        info!("Session state: {:?}", self.state.connection);
+                        self.ctx.state.connection = ConnectionState::Connected;
+                        info!("Session state: {:?}", self.ctx.state.connection);
                     } else {
                         // info!("Other message. {:?}", msg);
                         self.handle_msg(&mut sink, msg).await?;
@@ -232,34 +239,37 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         message: Message,
     ) -> Result<()> {
+
+        self.ctx.counters.protocol.down.add(message.protocol_len());
+
         match message {
             Message::KeepAlive => {
                 info!("KeepAlive received from peer");
             }
             Message::Choke => {
                 info!("Peer choking us");
-                if !self.state.is_choked {
-                    self.state.is_choked = true;
+                if !self.ctx.state.is_choked {
+                    self.ctx.state.is_choked = true;
                     self.free_pending_blocks().await;
                 }
             }
             Message::Unchoke => {
-                if self.state.is_choked {
+                if self.ctx.state.is_choked {
                     info!("Peer unchoked us");
-                    self.state.is_choked = false;
+                    self.ctx.state.is_choked = false;
 
-                    if self.state.is_interested {
+                    if self.ctx.state.is_interested {
                         self.make_requests(sink).await?
                     }
                 }
             }
             Message::Interested => {
                 tracing::info!("Peer is interested in us. Nothing to do here!");
-                self.state.is_peer_interested = true;
+                self.ctx.state.is_peer_interested = true;
             }
             Message::NotInterested => {
                 tracing::info!("Peer is not interested in us. Nothing to do here!");
-                self.state.is_peer_interested = false;
+                self.ctx.state.is_peer_interested = false;
             }
             Message::Have(piece_index) => {
                 tracing::info!("Peer has piece {}", piece_index);
@@ -287,7 +297,7 @@ impl PeerSession {
                     offset: block_data.offset,
                     length: block_data.data.len() as u32,
                 };
-                self.state.total_downloaded_bytes += block_data.data.len() as u64;
+                self.ctx.counters.payload.down.add(block_data.data.len() as u64);
 
                 // let torrent_size = self.torrent.torrent.metainfo.info.length.unwrap();
                 // let percent_downloaded =
@@ -367,6 +377,9 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         mut bitfield: BitField,
     ) -> Result<()> {
+
+        self.ctx.counters.payload.down.add(MessageId::BitField.header_len() + bitfield.len() as u64);
+
         bitfield.resize(self.torrent.storage.piece_count, false);
 
         let interested = self
@@ -387,7 +400,7 @@ impl PeerSession {
             );
         }
 
-        self.update_interest(sink, interested).await;
+        self.update_interest(sink, interested).await?;
 
         Ok(())
     }
@@ -397,13 +410,14 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         is_interested: bool,
     ) -> Result<()> {
-        if !self.state.is_interested && is_interested {
+        if !self.ctx.state.is_interested && is_interested {
+            self.ctx.counters.protocol.up.add(MessageId::Interested.header_len());
             sink.send(Message::Interested).await?;
             info!("Became interested in peer");
-            self.state.is_interested = true;
-        } else if self.state.is_interested && !is_interested {
+            self.ctx.state.is_interested = true;
+        } else if self.ctx.state.is_interested && !is_interested {
             info!("No longer interested in peer");
-            self.state.is_interested = false;
+            self.ctx.state.is_interested = false;
         }
 
         Ok(())
@@ -415,11 +429,14 @@ impl PeerSession {
         _instant: Instant,
     ) -> Result<()> {
         let _free_count = 0;
-        if !self.state.is_choked {
-            if self.state.is_interested && self.outgoing_requests.len() < 8 {
+        if !self.ctx.state.is_choked {
+            if self.ctx.state.is_interested && self.outgoing_requests.len() < 8 {
                 self.make_requests(sink).await?;
             }
         }
+
+        self.ctx.counters.reset();
+
         Ok(())
     }
 
@@ -429,12 +446,12 @@ impl PeerSession {
     ) -> Result<()> {
         trace!("Making requests");
 
-        if self.state.is_choked {
+        if self.ctx.state.is_choked {
             debug!("Can't make requests while choked");
             return Ok(());
         }
 
-        if !self.state.is_interested {
+        if !self.ctx.state.is_interested {
             debug!("Can't make requests while not interested");
             return Ok(());
         }
@@ -451,7 +468,6 @@ impl PeerSession {
 
         let mut request_queue = Vec::with_capacity(requests_left);
 
-        // let mut in_download_piece_map = self.torrent.downloads.write().await;
         trace!(
             "Total in torrent download {}",
             self.torrent.downloads.read().await.len()
@@ -523,15 +539,29 @@ impl PeerSession {
         // Make some requests now
         self.outgoing_requests
             .extend(request_queue.clone().into_iter());
-        let mut it = futures::stream::iter(
-            request_queue
-                .into_iter()
-                .map(|b| Message::Request(b))
-                .map(Ok),
-        );
+
+        // let requests = request_queue.into_iter().map(|b| Message::Request(b)).collect::<Vec<_>>();
+
+        let mut requests = Vec::with_capacity(request_queue.len());
+        let mut protocol_bytes = 0u64;
+
+        for req in request_queue {
+
+            let msg = Message::Request(req);
+
+            protocol_bytes += msg.protocol_len();
+
+            requests.push(Ok(msg));
+        }
+
+        self.ctx.counters.protocol.up.add(protocol_bytes);
+
         trace!(
             "Sending requests through sink. Total outgoing requests now: {}",
             self.outgoing_requests.len()
+        );
+        let mut it = futures::stream::iter(
+            requests.into_iter()
         );
         sink.send_all(&mut it).await?;
 
@@ -547,10 +577,15 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
     ) -> Result<()> {
         // Send cancel to all pending messages
+        let mut protocol_bytes = 0u64;
 
         for block_info in self.outgoing_requests.drain() {
-            sink.send(Message::Cancel(block_info)).await.ok();
+            let msg = Message::Cancel(block_info);
+            protocol_bytes += msg.protocol_len();
+            sink.send(msg).await.ok();
         }
+
+        self.ctx.counters.protocol.up.add(protocol_bytes);
 
         Ok(())
     }

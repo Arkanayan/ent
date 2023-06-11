@@ -28,7 +28,7 @@ impl HandShake {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u64 {
         19 + 8 + 20 + 20
     }
 }
@@ -120,6 +120,23 @@ pub enum MessageId {
     Port = 9,
 }
 
+impl MessageId {
+    pub fn header_len(&self) -> u64 {
+        match self {
+            MessageId::Choke => 4 + 1,
+            MessageId::Unchoke => 4 + 1,
+            MessageId::Interested => 4 + 1,
+            MessageId::NotInterested => 4 + 1,
+            MessageId::Have => 4 + 1 + 4,
+            MessageId::BitField => 4 + 1,
+            MessageId::Request => 4 + 1 + 3 * 4,
+            MessageId::Piece => 4 + 1 + 4 + 4,
+            MessageId::Cancel => 4 + 1 + 3 * 4,
+            MessageId::Port => 4 + 1 + 2,
+        }
+    }
+}
+
 impl TryFrom<u8> for MessageId {
     type Error = anyhow::Error;
 
@@ -140,7 +157,7 @@ impl TryFrom<u8> for MessageId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Message {
     KeepAlive,
     Choke,
@@ -153,6 +170,33 @@ pub enum Message {
     Piece(BlockData),
     Cancel(BlockInfo),
     Port(u16),
+}
+
+impl Message {
+    pub fn id(&self) -> Option<MessageId> {
+        match self {
+            Message::KeepAlive => None,
+            Message::Choke => Some(MessageId::Choke),
+            Message::Unchoke => Some(MessageId::Unchoke),
+            Message::Interested => Some(MessageId::Interested),
+            Message::NotInterested => Some(MessageId::NotInterested),
+            Message::Have(_) => Some(MessageId::Have),
+            Message::BitField(_) => Some(MessageId::BitField),
+            Message::Request(_) => Some(MessageId::Request),
+            Message::Piece(_) => Some(MessageId::Piece),
+            Message::Cancel(_) => Some(MessageId::Cancel),
+            Message::Port(_) => Some(MessageId::Port),
+        }
+    }
+    pub fn protocol_len(&self) -> u64 {
+
+        if let Some(id) = self.id() {
+            id.header_len()
+        } else {
+            assert_eq!(*self, Self::KeepAlive);
+            1
+        }
+    }
 }
 
 pub type BitField = BitVec<u8, Msb0>;
@@ -174,38 +218,38 @@ impl Encoder<Message> for MessageCodec {
             }
             Choke => {
                 let msg_len = 1;
-                dst.reserve(4 + 4);
+                dst.reserve(4 + 1);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::Choke as u8);
             }
             Unchoke => {
                 let msg_len = 1;
-                dst.reserve(4 + 4);
+                dst.reserve(4 + 1);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::Unchoke as u8);
             }
             Interested => {
                 let msg_len = 1;
-                dst.reserve(4 + 4);
+                dst.reserve(4 + 1);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::Interested as u8);
             }
             NotInterested => {
                 let msg_len = 1;
-                dst.reserve(4 + 4);
+                dst.reserve(4 + 1);
                 dst.put_u32(msg_len);
                 dst.put_u8(MessageId::NotInterested as u8);
             }
             Have(index) => {
                 let msg_len = 1 + 4;
-                dst.reserve(4 * 3);
+                dst.reserve(4 + 1 + 4);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Have as u8);
                 dst.put_u32(index as u32);
             }
             BitField(bv) => {
                 let msg_len = 1 + bv.len() / 8;
-                dst.reserve(4 + 4);
+                dst.reserve(4 + 1);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::BitField as u8);
                 dst.extend_from_slice(bv.as_raw_slice());
@@ -216,7 +260,7 @@ impl Encoder<Message> for MessageCodec {
                 length,
             }) => {
                 let msg_len = 1 + 4 + 4 + 4;
-                dst.reserve(4 + msg_len * 4);
+                dst.reserve(4 + 1 + 3 * 4);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Request as u8);
                 dst.put_u32(piece_index as u32);
@@ -251,7 +295,7 @@ impl Encoder<Message> for MessageCodec {
             }
             Port(port) => {
                 let msg_len = 1 + 2;
-                dst.reserve(1 + msg_len * 4);
+                dst.reserve(4 + 1 + 2);
                 dst.put_u32(msg_len as u32);
                 dst.put_u8(MessageId::Port as u8);
                 dst.put_u16(port);
