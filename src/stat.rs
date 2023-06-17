@@ -58,6 +58,10 @@ impl Counter {
         }
     }
 
+    pub fn round(&self) -> u64 {
+        self.round
+    }
+
     pub fn avg(&self) -> u64 {
         self.avg.round() as u64
     }

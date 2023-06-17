@@ -1,4 +1,6 @@
-use crate::{messages::BitField, units::PieceIndex};
+use tracing::info;
+
+use crate::{messages::BitField, units::PieceIndex, metainfo::Info};
 
 #[derive(Debug)]
 pub struct PiecePicker {

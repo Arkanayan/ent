@@ -21,11 +21,12 @@ use tracing::{debug, info, trace};
 
 use crate::{
     disk::{self, CommandSender},
-    download::PieceDownload,
+    download::{PieceDownload, BLOCK_LEN},
     messages::{BitField, HandShake, HandShakeCodec, Message, MessageCodec, MessageId},
     metainfo::PeerID,
+    stat::ThruputCounters,
     torrent::{BlockInfo, TorrentContext},
-    units::PieceIndex, stat::ThruputCounters,
+    units::PieceIndex,
 };
 
 #[derive(Debug, Default, PartialEq)]
@@ -55,15 +56,29 @@ pub struct PeerSession {
     pub peer: PeerInfo,
     cmd_rx: Receiver,
     disk_tx: CommandSender,
-    pub ctx: SessionContext
+    pub ctx: SessionContext,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionContext {
     pub counters: ThruputCounters,
-    pub state: SessionState
+    pub state: SessionState,
+    pub desired_queue_size: usize,
+    pub in_slow_start: bool,
+    pub in_end_game: bool,
 }
 
+impl Default for SessionContext {
+    fn default() -> Self {
+        Self {
+            counters: Default::default(),
+            state: Default::default(),
+            desired_queue_size: 4,
+            in_slow_start: true,
+            in_end_game: false,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PeerInfo {
@@ -118,7 +133,7 @@ impl PeerSession {
             repr: format!("{}", addr),
             cmd_rx: cmd_rx,
             disk_tx: disk_tx,
-            ctx: Default::default()
+            ctx: Default::default(),
         }
     }
 
@@ -188,7 +203,11 @@ impl PeerSession {
             let own_pieces = piece_picker_guard.own_pieces();
             if own_pieces.any() {
                 info!("Sending piece availability");
-                self.ctx.counters.protocol.up.add(MessageId::BitField.header_len() + own_pieces.len() as u64);
+                self.ctx
+                    .counters
+                    .protocol
+                    .up
+                    .add(MessageId::BitField.header_len() + own_pieces.len() as u64);
                 sink.send(Message::BitField(own_pieces.clone())).await?;
                 info!("Sent piece availability");
             }
@@ -239,7 +258,6 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         message: Message,
     ) -> Result<()> {
-
         self.ctx.counters.protocol.down.add(message.protocol_len());
 
         match message {
@@ -297,7 +315,11 @@ impl PeerSession {
                     offset: block_data.offset,
                     length: block_data.data.len() as u32,
                 };
-                self.ctx.counters.payload.down.add(block_data.data.len() as u64);
+                self.ctx
+                    .counters
+                    .payload
+                    .down
+                    .add(block_data.data.len() as u64);
 
                 // let torrent_size = self.torrent.torrent.metainfo.info.length.unwrap();
                 // let percent_downloaded =
@@ -350,6 +372,12 @@ impl PeerSession {
                 //         .received_piece(block_data.piece_index);
                 // }
 
+                if self.ctx.in_slow_start {
+                    self.ctx.desired_queue_size += 1;
+                }
+
+                self.update_desired_queue_size();
+
                 self.make_requests(sink).await?;
             }
             Message::Cancel(piece_block) => {
@@ -377,8 +405,11 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         mut bitfield: BitField,
     ) -> Result<()> {
-
-        self.ctx.counters.payload.down.add(MessageId::BitField.header_len() + bitfield.len() as u64);
+        self.ctx
+            .counters
+            .payload
+            .down
+            .add(MessageId::BitField.header_len() + bitfield.len() as u64);
 
         bitfield.resize(self.torrent.storage.piece_count, false);
 
@@ -411,7 +442,11 @@ impl PeerSession {
         is_interested: bool,
     ) -> Result<()> {
         if !self.ctx.state.is_interested && is_interested {
-            self.ctx.counters.protocol.up.add(MessageId::Interested.header_len());
+            self.ctx
+                .counters
+                .protocol
+                .up
+                .add(MessageId::Interested.header_len());
             sink.send(Message::Interested).await?;
             info!("Became interested in peer");
             self.ctx.state.is_interested = true;
@@ -428,14 +463,27 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         _instant: Instant,
     ) -> Result<()> {
-        let _free_count = 0;
+        info!(target: "peer connection", peer = self.repr,
+         func = "handle_tick", request_in_flight = self.outgoing_requests.len(), queue_size = self.ctx.desired_queue_size);
+
         if !self.ctx.state.is_choked {
-            if self.ctx.state.is_interested && self.outgoing_requests.len() < 8 {
+            if self.ctx.state.is_interested
+                && self.outgoing_requests.len() < self.ctx.desired_queue_size
+            {
                 self.make_requests(sink).await?;
             }
         }
 
+        if self.ctx.in_slow_start
+            && !self.ctx.state.is_choked
+            && self.ctx.counters.payload.down.round() > 0
+            && self.ctx.counters.payload.down.round() + 10000 < self.ctx.counters.payload.down.avg()
+        {
+            self.ctx.in_slow_start = false;
+        }
         self.ctx.counters.reset();
+
+        self.update_desired_queue_size();
 
         Ok(())
     }
@@ -456,17 +504,17 @@ impl PeerSession {
             return Ok(());
         }
 
-        const REQUEST_QUEUE_SIZE: usize = 8;
+        let desired_queue_size = self.ctx.desired_queue_size;
 
-        let mut requests_left = REQUEST_QUEUE_SIZE.saturating_sub(self.outgoing_requests.len());
+        let mut num_requests = desired_queue_size.saturating_sub(self.outgoing_requests.len());
 
-        trace!("Can make {} requests", requests_left);
+        trace!("Can make {} requests", num_requests);
 
-        if requests_left == 0 {
+        if num_requests == 0 {
             return Ok(());
         }
 
-        let mut request_queue = Vec::with_capacity(requests_left);
+        let mut request_queue = Vec::with_capacity(num_requests);
 
         trace!(
             "Total in torrent download {}",
@@ -481,20 +529,20 @@ impl PeerSession {
                 .await
                 .get_mut(&block.piece_index())
             {
-                if requests_left <= 0 {
+                if num_requests <= 0 {
                     break;
                 }
 
-                let new_blocks = piece.write().await.pick_blocks(requests_left);
+                let new_blocks = piece.write().await.pick_blocks(num_requests);
                 if new_blocks.len() > 0 {
-                    requests_left -= new_blocks.len();
+                    num_requests -= new_blocks.len();
                     request_queue.extend(new_blocks.into_iter());
                 }
             }
         }
 
         // If the queue is still not filled; grab new piece
-        while requests_left > 0 {
+        while num_requests > 0 {
             if let Some(piece_index) = self
                 .torrent
                 .piece_picker
@@ -504,10 +552,10 @@ impl PeerSession {
             {
                 let piece_info = &self.torrent.torrent.pieces[piece_index];
                 let mut piece_download = PieceDownload::new(piece_index, piece_info.length);
-                let new_blocks = piece_download.pick_blocks(requests_left);
+                let new_blocks = piece_download.pick_blocks(num_requests);
 
                 if new_blocks.len() > 0 {
-                    requests_left -= new_blocks.len();
+                    num_requests -= new_blocks.len();
                     request_queue.extend(new_blocks.into_iter());
                 }
                 self.torrent
@@ -546,7 +594,6 @@ impl PeerSession {
         let mut protocol_bytes = 0u64;
 
         for req in request_queue {
-
             let msg = Message::Request(req);
 
             protocol_bytes += msg.protocol_len();
@@ -560,9 +607,7 @@ impl PeerSession {
             "Sending requests through sink. Total outgoing requests now: {}",
             self.outgoing_requests.len()
         );
-        let mut it = futures::stream::iter(
-            requests.into_iter()
-        );
+        let mut it = futures::stream::iter(requests.into_iter());
         sink.send_all(&mut it).await?;
 
         Ok(())
@@ -588,5 +633,30 @@ impl PeerSession {
         self.ctx.counters.protocol.up.add(protocol_bytes);
 
         Ok(())
+    }
+
+    fn update_desired_queue_size(&mut self) {
+        let prev_queue_size = self.ctx.desired_queue_size;
+
+        let download_rate = self.ctx.counters.payload.down.avg();
+
+        // the length of the request queue given in the number of seconds it
+        // should take for the other end to send all the pieces. i.e. the
+        // actual number of requests depends on the download rate and this
+        // number.
+        let queue_time = 3;
+
+        let max_queue_size = 500;
+        let min_queue_size = 2;
+
+        if !self.ctx.in_slow_start {
+            self.ctx.desired_queue_size = ((queue_time * download_rate / BLOCK_LEN as u64)
+                as usize)
+                .clamp(min_queue_size, max_queue_size);
+        }
+
+        if prev_queue_size != self.ctx.desired_queue_size {
+            info!(target: "Update Queue Size", peer = self.repr, dqs = self.ctx.desired_queue_size);
+        }
     }
 }
