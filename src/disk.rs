@@ -100,7 +100,7 @@ impl DiskStorage {
                Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         Command::WriteBlock(block_info, bytes) => {
-                            info!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
+                            trace!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
                             self.write_block(&mut buf, block_info, bytes).await;
                         },
                         Command::Shutdown => {

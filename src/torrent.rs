@@ -335,6 +335,7 @@ impl Torrent {
             .min(self.available_peers.len());
 
         // Connect to peers
+        info!("Found peers: {}", self.available_peers.len());
         for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
             let disk_tx = self.disk.as_ref().map(|d| d.cmd_tx.clone()).unwrap();

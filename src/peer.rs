@@ -463,8 +463,8 @@ impl PeerSession {
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
         _instant: Instant,
     ) -> Result<()> {
-        info!(target: "peer connection", peer = self.repr,
-         func = "handle_tick", request_in_flight = self.outgoing_requests.len(), queue_size = self.ctx.desired_queue_size);
+        trace!(target: "peer_connection_tick", peer = self.repr,
+         request_in_flight = self.outgoing_requests.len(), queue_size = self.ctx.desired_queue_size);
 
         if !self.ctx.state.is_choked {
             if self.ctx.state.is_interested
@@ -656,7 +656,7 @@ impl PeerSession {
         }
 
         if prev_queue_size != self.ctx.desired_queue_size {
-            info!(target: "Update Queue Size", peer = self.repr, dqs = self.ctx.desired_queue_size);
+            info!(target: "Request queue size changed", peer = self.repr, previous = prev_queue_size, new = self.ctx.desired_queue_size);
         }
     }
 }
