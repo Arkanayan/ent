@@ -66,6 +66,7 @@ pub struct SessionContext {
     pub desired_queue_size: usize,
     pub in_slow_start: bool,
     pub in_end_game: bool,
+    pub last_sent_time: Option<Instant>
 }
 
 impl Default for SessionContext {
@@ -76,6 +77,7 @@ impl Default for SessionContext {
             desired_queue_size: 4,
             in_slow_start: true,
             in_end_game: false,
+            last_sent_time: None
         }
     }
 }
@@ -114,6 +116,8 @@ impl Default for SessionState {
 }
 
 impl PeerSession {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
     pub fn new(
         torrent_context: Arc<TorrentContext>,
         addr: SocketAddr,
@@ -159,14 +163,15 @@ impl PeerSession {
         self.ctx.counters.protocol.up.add(handshake.len());
 
         socket.send(handshake).await?;
-        info!("Handshake sent");
+        info!(target: "outgoing_message", peer = self.repr, "Handshake sent");
+        self.ctx.last_sent_time = Some(Instant::now());
 
         if let Some(peer_handshake) = socket.next().await {
-            info!("Packet received from peer. Should be handshake");
+            info!(target: "incoming_message", "Packet received from peer. Should be handshake");
 
             let handshake = peer_handshake?;
             self.ctx.counters.protocol.down.add(handshake.len());
-            info!(target: "connection", addr = self.peer.addr.to_string(), "Handshake received");
+            info!(target: "connection", peer = self.repr, "Handshake received");
             log::trace!(
                 target: &self.repr,
                 "Handshake: {:?}, Peer Id: {}",
@@ -210,6 +215,7 @@ impl PeerSession {
                     .add(MessageId::BitField.header_len() + own_pieces.len() as u64);
                 sink.send(Message::BitField(own_pieces.clone())).await?;
                 info!("Sent piece availability");
+                self.ctx.last_sent_time = Some(Instant::now());
             }
         }
 
@@ -262,7 +268,7 @@ impl PeerSession {
 
         match message {
             Message::KeepAlive => {
-                info!("KeepAlive received from peer");
+                info!(target: "incoming_message", peer = self.repr, "KeepAlive received");
             }
             Message::Choke => {
                 info!("Peer choking us");
@@ -450,6 +456,7 @@ impl PeerSession {
             sink.send(Message::Interested).await?;
             info!("Became interested in peer");
             self.ctx.state.is_interested = true;
+            self.ctx.last_sent_time = Some(Instant::now());
         } else if self.ctx.state.is_interested && !is_interested {
             info!("No longer interested in peer");
             self.ctx.state.is_interested = false;
@@ -482,6 +489,8 @@ impl PeerSession {
             self.ctx.in_slow_start = false;
         }
         self.ctx.counters.reset();
+
+        self.send_keepalive(sink).await?;
 
         self.update_desired_queue_size();
 
@@ -609,7 +618,7 @@ impl PeerSession {
         );
         let mut it = futures::stream::iter(requests.into_iter());
         sink.send_all(&mut it).await?;
-
+        self.ctx.last_sent_time = Some(Instant::now());
         Ok(())
     }
 
@@ -629,6 +638,7 @@ impl PeerSession {
             protocol_bytes += msg.protocol_len();
             sink.send(msg).await.ok();
         }
+        self.ctx.last_sent_time = Some(Instant::now());
 
         self.ctx.counters.protocol.up.add(protocol_bytes);
 
@@ -658,5 +668,24 @@ impl PeerSession {
         if prev_queue_size != self.ctx.desired_queue_size {
             info!(target: "Request queue size changed", peer = self.repr, previous = prev_queue_size, new = self.ctx.desired_queue_size);
         }
+    }
+
+    async fn send_keepalive(&mut self, sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>) -> Result<()> {
+        
+        if !matches!(self.ctx.state.connection, ConnectionState::Connected) {
+            return Ok(());
+        }
+
+        if let Some(last) = self.ctx.last_sent_time {
+            let duration = Instant::now().saturating_duration_since(last);
+
+            if duration < Self::TIMEOUT / 2 {
+                return Ok(());
+            }
+
+            trace!(target: "outgoing_message", peer = self.repr, r#type = "keepalive");
+            sink.send(Message::KeepAlive).await?;
+        }
+        Ok(())
     }
 }
