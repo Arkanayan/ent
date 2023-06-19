@@ -51,7 +51,8 @@ type Receiver = UnboundedReceiver<Command>;
 #[derive(Debug)]
 pub struct PeerSession {
     pub repr: String,
-    pub outgoing_requests: HashSet<BlockInfo>,
+    pub download_queue: HashSet<BlockInfo>,
+    pub request_queue: Vec<BlockInfo>,
     pub torrent: Arc<TorrentContext>,
     pub peer: PeerInfo,
     cmd_rx: Receiver,
@@ -66,7 +67,7 @@ pub struct SessionContext {
     pub desired_queue_size: usize,
     pub in_slow_start: bool,
     pub in_end_game: bool,
-    pub last_sent_time: Option<Instant>
+    pub last_sent_time: Option<Instant>,
 }
 
 impl Default for SessionContext {
@@ -77,7 +78,7 @@ impl Default for SessionContext {
             desired_queue_size: 4,
             in_slow_start: true,
             in_end_game: false,
-            last_sent_time: None
+            last_sent_time: None,
         }
     }
 }
@@ -132,7 +133,8 @@ impl PeerSession {
                 pieces: BitField::with_capacity(piece_count),
                 piece_count: piece_count,
             },
-            outgoing_requests: HashSet::new(),
+            download_queue: HashSet::new(),
+            request_queue: Vec::new(),
             torrent: torrent_context,
             repr: format!("{}", addr),
             cmd_rx: cmd_rx,
@@ -339,7 +341,28 @@ impl PeerSession {
                 //     percent_downloaded
                 // );
 
-                self.outgoing_requests.remove(&block_info);
+                let present = self.download_queue.remove(&block_info);
+                if !present {
+                    info!(target: "incoming_piece", peer = self.repr, block = ?block_info, "Invalid block received. Block was not requested");
+                    return Ok(());
+                }
+
+                let mut downloaded = false;
+                if let Some(piece_download) = self
+                    .torrent
+                    .downloads
+                    .read()
+                    .await
+                    .get(&block_info.piece_index())
+                {
+                    let pd = piece_download.read().await;
+                    downloaded = pd.is_downloaded(&block_info);
+                }
+
+                if downloaded {
+                    info!(target: "incoming_piece", peer = self.repr, block = ?block_info, "Block already downloaded");
+                    return Ok(());
+                }
 
                 self.disk_tx
                     .send(disk::Command::WriteBlock(
@@ -353,7 +376,7 @@ impl PeerSession {
                 if let Some(piece_download) = self
                     .torrent
                     .downloads
-                    .read()
+                    .write()
                     .await
                     .get(&block_data.piece_index)
                 {
@@ -398,7 +421,7 @@ impl PeerSession {
     async fn free_pending_blocks(&mut self) {
         let download_guard = self.torrent.downloads.write().await;
 
-        for block_info in self.outgoing_requests.drain() {
+        for block_info in self.download_queue.drain() {
             if let Some(download) = download_guard.get(&block_info.piece_index()) {
                 debug!("Freeing block: {:?}", block_info);
                 download.write().await.free_block(&block_info);
@@ -471,11 +494,11 @@ impl PeerSession {
         _instant: Instant,
     ) -> Result<()> {
         trace!(target: "peer_connection_tick", peer = self.repr,
-         request_in_flight = self.outgoing_requests.len(), queue_size = self.ctx.desired_queue_size);
+         request_in_flight = self.download_queue.len(), queue_size = self.ctx.desired_queue_size);
 
         if !self.ctx.state.is_choked {
             if self.ctx.state.is_interested
-                && self.outgoing_requests.len() < self.ctx.desired_queue_size
+                && self.download_queue.len() < self.ctx.desired_queue_size
             {
                 self.make_requests(sink).await?;
             }
@@ -486,6 +509,7 @@ impl PeerSession {
             && self.ctx.counters.payload.down.round() > 0
             && self.ctx.counters.payload.down.round() + 10000 < self.ctx.counters.payload.down.avg()
         {
+            trace!(target: "update_slow_start", peer = self.repr, "Slow start disabled");
             self.ctx.in_slow_start = false;
         }
         self.ctx.counters.reset();
@@ -515,7 +539,7 @@ impl PeerSession {
 
         let desired_queue_size = self.ctx.desired_queue_size;
 
-        let mut num_requests = desired_queue_size.saturating_sub(self.outgoing_requests.len());
+        let mut num_requests = desired_queue_size.saturating_sub(self.download_queue.len());
 
         trace!("Can make {} requests", num_requests);
 
@@ -530,7 +554,7 @@ impl PeerSession {
             self.torrent.downloads.read().await.len()
         );
         // First try to complete alredy downloading pieces
-        for block in &self.outgoing_requests {
+        for block in &self.download_queue {
             if let Some(piece) = self
                 .torrent
                 .downloads
@@ -594,7 +618,7 @@ impl PeerSession {
         // }
 
         // Make some requests now
-        self.outgoing_requests
+        self.download_queue
             .extend(request_queue.clone().into_iter());
 
         // let requests = request_queue.into_iter().map(|b| Message::Request(b)).collect::<Vec<_>>();
@@ -614,7 +638,7 @@ impl PeerSession {
 
         trace!(
             "Sending requests through sink. Total outgoing requests now: {}",
-            self.outgoing_requests.len()
+            self.download_queue.len()
         );
         let mut it = futures::stream::iter(requests.into_iter());
         sink.send_all(&mut it).await?;
@@ -623,7 +647,7 @@ impl PeerSession {
     }
 
     async fn handle_piece_completion(&mut self, index: PieceIndex) {
-        self.outgoing_requests.retain(|b| b.piece_index() != index)
+        self.download_queue.retain(|b| b.piece_index() != index)
     }
 
     async fn handle_shutdown(
@@ -633,7 +657,7 @@ impl PeerSession {
         // Send cancel to all pending messages
         let mut protocol_bytes = 0u64;
 
-        for block_info in self.outgoing_requests.drain() {
+        for block_info in self.download_queue.drain() {
             let msg = Message::Cancel(block_info);
             protocol_bytes += msg.protocol_len();
             sink.send(msg).await.ok();
@@ -670,8 +694,10 @@ impl PeerSession {
         }
     }
 
-    async fn send_keepalive(&mut self, sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>) -> Result<()> {
-        
+    async fn send_keepalive(
+        &mut self,
+        sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
+    ) -> Result<()> {
         if !matches!(self.ctx.state.connection, ConnectionState::Connected) {
             return Ok(());
         }
@@ -688,4 +714,8 @@ impl PeerSession {
         }
         Ok(())
     }
+
+    // async fn pick_blocks(&mut self) -> Result<()> {
+        
+    // }
 }

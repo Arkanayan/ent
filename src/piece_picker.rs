@@ -1,6 +1,6 @@
 use tracing::info;
 
-use crate::{messages::BitField, units::PieceIndex, metainfo::Info};
+use crate::{messages::BitField, units::PieceIndex, metainfo::Info, torrent::BlockInfo};
 
 #[derive(Debug)]
 pub struct PiecePicker {

@@ -88,6 +88,11 @@ impl PieceDownload {
 
         picked_blocks
     }
+
+    pub fn is_downloaded(&self, block: &BlockInfo) -> bool {
+        matches!(self.blocks[block.index_in_piece()], BlockStatus::Received)
+
+    }
 }
 
 

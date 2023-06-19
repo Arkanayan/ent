@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::Cursor,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -46,6 +46,8 @@ pub struct TorrentContext {
     pub piece_picker: RwLock<PiecePicker>,
     pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
     pub torrent: Arc<TorrentInfo>,
+    /// Number of peers connected at the moment
+    pub num_connected_peers: AtomicUsize
 }
 
 #[derive(Debug, Clone)]
@@ -122,11 +124,12 @@ impl TorrentInfo {
     }
 }
 
-pub type Sender = mpsc::UnboundedSender<Alert>;
-pub type Receiver = mpsc::UnboundedReceiver<Alert>;
+pub type PeerNotificationSender = mpsc::UnboundedSender<PeerNotification>;
+pub type PeerNotificationReceiver = mpsc::UnboundedReceiver<PeerNotification>;
 
-pub enum Alert {
-    PeerDisconnected { addr: SocketAddr },
+pub enum PeerNotification {
+    Connected { addr: SocketAddr },
+    Disconnected { addr: SocketAddr },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;
@@ -178,6 +181,7 @@ impl Torrent {
             info_hash: torrent.info_hash,
             torrent: Arc::new(torrent),
             storage: storage_info,
+            num_connected_peers: AtomicUsize::new(0)
         };
 
         Self {
@@ -342,6 +346,7 @@ impl Torrent {
             let mut peer_session =
                 PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
+            self.torrent.num_connected_peers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });
         }
