@@ -150,7 +150,7 @@ impl PeerSession {
         info!(peer = self.repr, "TCP Socket Connected");
 
         let socket = Framed::new(socket, HandShakeCodec);
-        self.ctx.state.connection = ConnectionState::Handshaking;
+        self.ctx.state.connection = ConnectionState::Connecting;
 
         self.handle_connection(socket).await
     }
@@ -164,6 +164,7 @@ impl PeerSession {
 
         self.ctx.counters.protocol.up.add(handshake.len());
 
+        self.ctx.state.connection = ConnectionState::Handshaking;
         socket.send(handshake).await?;
         info!(target: "outgoing_message", peer = self.repr, "Handshake sent");
         self.ctx.last_sent_time = Some(Instant::now());
@@ -195,10 +196,15 @@ impl PeerSession {
         socket.write_buf = old_parts.write_buf;
         let socket = Framed::from_parts(socket);
 
-        // if let Err(e) = self.run(socke).await {
-        //     return Err(anyhow!("Peer Disconnected"));
-        // }
-        self.run(socket).await
+        if let Err(e) = self.run(socket).await {
+            return Err(e.context("Peer disconnected with error"));
+        }
+
+        self.ctx.state.connection = ConnectionState::Disconnected;
+
+        self.torrent.cmd_tx.send(crate::torrent::Command::PeerDisconnected { addr: self.peer.addr })?;
+
+        Ok(())
     }
 
     pub async fn run(&mut self, socket: Framed<TcpStream, MessageCodec>) -> Result<()> {
@@ -243,6 +249,7 @@ impl PeerSession {
 
                         self.ctx.state.connection = ConnectionState::Connected;
                         info!("Session state: {:?}", self.ctx.state.connection);
+                        self.torrent.cmd_tx.send(crate::torrent::Command::PeerConnected { addr: self.peer.addr, id: self.peer.id.unwrap() })?;
                     } else {
                         // info!("Other message. {:?}", msg);
                         self.handle_msg(&mut sink, msg).await?;

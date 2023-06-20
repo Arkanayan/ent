@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::Cursor,
     net::SocketAddr,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{atomic::AtomicUsize, Arc},
     time::{Duration, Instant},
 };
 
@@ -26,7 +26,7 @@ use crate::{
     peer::{self, PeerSession},
     piece_picker::PiecePicker,
     storage::StorageInfo,
-    tracker::TrackerData,
+    tracker::{Peer, TrackerData},
     units::PieceIndex,
 };
 
@@ -47,7 +47,9 @@ pub struct TorrentContext {
     pub downloads: RwLock<HashMap<PieceIndex, RwLock<PieceDownload>>>,
     pub torrent: Arc<TorrentInfo>,
     /// Number of peers connected at the moment
-    pub num_connected_peers: AtomicUsize
+    pub num_connected_peers: AtomicUsize,
+    /// Used for sending messages to the torrent by the peers
+    pub cmd_tx: CmdSender,
 }
 
 #[derive(Debug, Clone)]
@@ -132,13 +134,13 @@ pub enum PeerNotification {
     Disconnected { addr: SocketAddr },
 }
 
-pub type CommandSender = mpsc::UnboundedSender<Command>;
-pub type CommandReceiver = mpsc::UnboundedReceiver<Command>;
+pub type CmdSender = mpsc::UnboundedSender<Command>;
+pub type CmdReceiver = mpsc::UnboundedReceiver<Command>;
 
 #[derive(Debug)]
 pub enum Command {
-    WriteBlock(BlockInfo, Vec<u8>),
-    Shutdown,
+    PeerConnected { addr: SocketAddr, id: PeerID },
+    PeerDisconnected { addr: SocketAddr },
 }
 
 pub struct PeerSessionEntry {
@@ -155,7 +157,8 @@ pub struct Torrent {
     pub run_duration: Duration,
     pub disk: Option<DiskEntry>,
     /// Num Pieces we have
-    pieces_count: usize
+    pieces_count: usize,
+    cmd_rx: CmdReceiver,
 }
 
 impl Torrent {
@@ -174,6 +177,7 @@ impl Torrent {
             torrent_len: torrent_len,
         };
 
+        let (tx, rx) = unbounded_channel();
         let torrent_context = TorrentContext {
             client_id,
             piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
@@ -181,7 +185,8 @@ impl Torrent {
             info_hash: torrent.info_hash,
             torrent: Arc::new(torrent),
             storage: storage_info,
-            num_connected_peers: AtomicUsize::new(0)
+            num_connected_peers: AtomicUsize::new(0),
+            cmd_tx: tx,
         };
 
         Self {
@@ -192,7 +197,8 @@ impl Torrent {
             start_time: None,
             run_duration: Default::default(),
             disk: None,
-            pieces_count: 0
+            pieces_count: 0,
+            cmd_rx: rx,
         }
     }
 
@@ -239,25 +245,36 @@ impl Torrent {
         use disk::Alert::*;
         loop {
             select! {
-                    tick_time = ticker.tick() => {
-                        self.tick(&mut last_tick_time, tick_time.into_std()).await?;
+                tick_time = ticker.tick() => {
+                    self.tick(&mut last_tick_time, tick_time.into_std()).await?;
+                }
+                Some(cmd) = self.disk.as_mut().unwrap().alert_rx.recv() => {
+                    match cmd {
+                        BlockWriteError(_, _) => todo!(),
+                        PieceCompletion(index) => {
+                            self.handle_piece_completion(index).await?;
+                        },
+                        PieceHashMismatch(index) => {
+                            self.handle_piece_hash_mismatch(index).await;
+                        },
+                        TorrentCompletion => {
+                            // Shutdown all operations
+                            self.handle_torrent_completion().await?;
+                            info!("Torrent Completed");
+                            return Ok(());
+                        }
                     }
-                    Some(cmd) = self.disk.as_mut().unwrap().alert_rx.recv() => {
-                        match cmd {
-                            BlockWriteError(_, _) => todo!(),
-                            PieceCompletion(index) => {
-                                self.handle_piece_completion(index).await?;
-                            },
-                            PieceHashMismatch(index) => {
-                                self.handle_piece_hash_mismatch(index).await;
-                            },
-                            TorrentCompletion => {
-                                // Shutdown all operations
-                                self.handle_torrent_completion().await?;
-                                info!("Torrent Completed");
-                                return Ok(());
-                            }
-
+                }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    match cmd {
+                        Command::PeerConnected { addr, id } => {
+                            info!(target: "peer_events", addr = %addr, "Peer Connected");
+                            self.torrent.num_connected_peers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Command::PeerDisconnected { addr } => {
+                            info!(target: "peer_events", addr = %addr, "Peer Disconnected");
+                            self.torrent.num_connected_peers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -278,7 +295,6 @@ impl Torrent {
     }
 
     async fn handle_torrent_completion(&mut self) -> Result<()> {
-
         for sess in self.peer_sessions.values() {
             sess.cmd_tx.send(peer::Command::Shutdown).ok();
         }
@@ -314,8 +330,12 @@ impl Torrent {
 
         self.pieces_count += 1;
 
-        let percent_complete = (self.pieces_count as f32 / self.torrent.storage.piece_count as f32) as f32 * 100f32;
-        info!("We have {}/{} {:.2}%", self.pieces_count, self.torrent.storage.piece_count, percent_complete);
+        let percent_complete =
+            (self.pieces_count as f32 / self.torrent.storage.piece_count as f32) as f32 * 100f32;
+        info!(
+            "We have {}/{} {:.2}%",
+            self.pieces_count, self.torrent.storage.piece_count, percent_complete
+        );
 
         self.torrent.downloads.write().await.remove(&index);
 
@@ -346,7 +366,9 @@ impl Torrent {
             let mut peer_session =
                 PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
-            self.torrent.num_connected_peers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.torrent
+                .num_connected_peers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.peer_sessions
                 .insert(addr, PeerSessionEntry { handle, cmd_tx: tx });
         }
