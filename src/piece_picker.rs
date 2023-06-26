@@ -8,9 +8,9 @@ pub struct PiecePicker {
 
     pub pieces: Vec<Piece>,
 
-    // Number of pieces haven't received yet (maybe picked)
+    /// Number of pieces haven't received yet (maybe picked)
     pub missing_count: usize,
-    // Number of pieces that can be picked
+    /// Number of pieces that can be picked
     pub free_count: usize,
 }
 

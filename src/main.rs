@@ -6,6 +6,7 @@ use once_cell::sync::{Lazy};
 
 use rand::{thread_rng, distributions::Alphanumeric, Rng, seq::SliceRandom};
 use torrent::{TorrentInfo, Torrent};
+use tracing::info;
 
 mod metainfo;
 mod tracker;
@@ -20,6 +21,7 @@ mod units;
 mod download;
 mod disk;
 mod stat;
+mod avg;
 
 
 static PEER_ID: Lazy<metainfo::PeerID> = Lazy::new(|| {
@@ -35,6 +37,7 @@ async fn main() -> Result<()> {
     // let meta_info = metainfo::read_torrent_file("debian.torrent")?;
     // info!("{}", t.info.pieces.len());
     let tracker_data = tracker::get_peer_details_from_tracker(&meta_info, &PEER_ID).await?;
+    info!(target: "main", peers = ?tracker_data.peers);
 
     let torrent_info = TorrentInfo::new(&meta_info, &tracker_data);
 
