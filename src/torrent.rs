@@ -38,7 +38,6 @@ pub struct TorrentInfo {
     pub metainfo: MetaInfo,
 }
 
-#[derive(Debug)]
 pub struct TorrentContext {
     pub storage: StorageInfo,
     pub info_hash: [u8; 20],
@@ -180,7 +179,7 @@ impl Torrent {
         let (tx, rx) = unbounded_channel();
         let torrent_context = TorrentContext {
             client_id,
-            piece_picker: RwLock::new(PiecePicker::new(torrent.pieces.len())),
+            piece_picker: RwLock::new(PiecePicker::new(torrent_len, piece_len)),
             downloads: Default::default(),
             info_hash: torrent.info_hash,
             torrent: Arc::new(torrent),

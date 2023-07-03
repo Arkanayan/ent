@@ -50,7 +50,6 @@ pub enum Command {
 pub(crate) type Sender = UnboundedSender<Command>;
 type Receiver = UnboundedReceiver<Command>;
 
-#[derive(Debug)]
 pub struct PeerSession {
     pub repr: String,
     pub download_queue: HashSet<BlockInfo>,
