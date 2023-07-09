@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // info!("PEER_ID: {}", PEER_ID);
-    let meta_info = metainfo::read_torrent_file("ubuntu-22-10.torrent")?;
+    let meta_info = metainfo::read_torrent_file("debian-12.5.torrent")?;
     // let meta_info = metainfo::read_torrent_file("debian.torrent")?;
     // info!("{}", t.info.pieces.len());
     let tracker_data = tracker::get_peer_details_from_tracker(&meta_info, &PEER_ID).await?;

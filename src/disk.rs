@@ -14,6 +14,7 @@ use tokio::{select, fs};
 use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, info};
 
+use crate::piece_picker::PieceBlock;
 use crate::units::block_count;
 use crate::{storage::StorageInfo, torrent::BlockInfo, units::PieceIndex};
 
@@ -198,7 +199,7 @@ pub enum Alert {
     PieceHashMismatch(PieceIndex),
     BlockWriteError(BlockInfo, BlockWriteError),
     PieceCompletion(PieceIndex),
-    TorrentCompletion
+    TorrentCompletion,
 }
 
 #[derive(Debug)]

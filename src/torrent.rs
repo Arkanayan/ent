@@ -24,7 +24,7 @@ use crate::{
     download::{PieceDownload, BLOCK_LEN},
     metainfo::{MetaInfo, PeerID},
     peer::{self, PeerSession},
-    piece_picker::PiecePicker,
+    piece_picker::{PiecePicker, PieceBlock},
     storage::StorageInfo,
     tracker::{Peer, TrackerData},
     units::PieceIndex,
@@ -86,7 +86,7 @@ pub struct BlockData {
 
 impl TorrentInfo {
     pub fn new(meta_info: &MetaInfo, tracker_data: &TrackerData) -> Self {
-        let num_pieces = (meta_info.info.pieces.len() / 20) as usize;
+        let num_pieces = meta_info.info.pieces.len() / 20;
         let piece_length = meta_info.info.piece_length;
         // Considering single file mode
         let length = meta_info.info.length.unwrap();
@@ -138,8 +138,14 @@ pub type CmdReceiver = mpsc::UnboundedReceiver<Command>;
 
 #[derive(Debug)]
 pub enum Command {
-    PeerConnected { addr: SocketAddr, id: PeerID },
-    PeerDisconnected { addr: SocketAddr },
+    PeerConnected {
+        addr: SocketAddr,
+        id: PeerID,
+    },
+    PeerDisconnected {
+        addr: SocketAddr,
+    },
+    CancelRequest(PieceBlock)
 }
 
 pub struct PeerSessionEntry {
@@ -274,6 +280,11 @@ impl Torrent {
                             info!(target: "peer_events", addr = %addr, "Peer Disconnected");
                             self.torrent.num_connected_peers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        Command::CancelRequest(pb) => {
+                            for ps in self.peer_sessions.values() {
+                                ps.cmd_tx.send(peer::Command::CancelRequest(pb));
+                            }
+                        }
                     }
                 }
             }
@@ -362,8 +373,7 @@ impl Torrent {
         for addr in self.available_peers.drain(..can_connect_to) {
             let (tx, rx) = unbounded_channel();
             let disk_tx = self.disk.as_ref().map(|d| d.cmd_tx.clone()).unwrap();
-            let mut peer_session =
-                PeerSession::new(Arc::clone(&self.torrent), addr.clone(), rx, disk_tx);
+            let mut peer_session = PeerSession::new(Arc::clone(&self.torrent), addr, rx, disk_tx);
             let handle = tokio::spawn(async move { peer_session.start_connection().await });
             self.torrent
                 .num_connected_peers

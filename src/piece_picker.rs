@@ -1,16 +1,17 @@
 use std::{cmp::Ordering, collections::HashMap, default, hash::Hash, net::SocketAddr, num};
 
-use bitvec::{macros::internal::funty::Fundamental, order};
+use bitvec::{macros::internal::funty::Fundamental, order, vec};
 use sha1::digest::typenum::bit;
-use tracing::info;
+use tracing::{debug, field::debug, info, trace};
 
 use crate::{download::BLOCK_LEN, messages::BitField, metainfo::Info, torrent, units::PieceIndex};
 
 pub const MAX_BLOCK_LEN: u32 = 1 << 14;
 
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub struct PieceBlock {
     pub piece_index: PieceIndex,
-    pub block_index: usize
+    pub block_index: usize,
 }
 
 pub struct PiecePicker {
@@ -28,7 +29,7 @@ pub struct PiecePicker {
     pub blocks_in_last_piece: u16,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Debug)]
 pub enum State {
     /// the piece is open to be picked
     #[default]
@@ -57,18 +58,52 @@ impl Piece {
     fn set_have(&mut self) {
         self.download_state = State::Finished;
     }
+
+    fn is_downloading(&self) -> bool {
+        self.download_state != State::Open
+    }
 }
 
 pub struct DownloadingPiece {
+    /// Piece index
     pub index: PieceIndex,
     /// the number of blocks in finished state
     pub finished: usize,
     /// the number of blocks in requested state
     pub requested: usize,
+    /// the number of blocks in writing state
+    pub writing: usize,
     pub blocks: Vec<BlockInfo>,
 }
 
-#[derive(Default)]
+impl DownloadingPiece {
+    fn new(index: PieceIndex, num_blocks: usize) -> Self {
+        Self {
+            blocks: vec![Default::default(); num_blocks],
+            finished: 0,
+            requested: 0,
+            writing: 0,
+            index,
+        }
+    }
+    fn get_piece_state(&self) -> State {
+        let num_blocks_in_piece = self.blocks.len();
+
+        if self.requested + self.writing + self.finished == 0 {
+            State::Open
+        } else if self.requested + self.writing + self.finished < num_blocks_in_piece {
+            State::Downloading
+        } else if self.requested > 0 {
+            assert!(self.requested + self.writing + self.finished == num_blocks_in_piece);
+            State::Full
+        } else {
+            assert!(self.finished == num_blocks_in_piece);
+            State::Finished
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
 pub struct BlockInfo {
     /// the peer this block was requested or downloaded from
     pub peer: Option<SocketAddr>,
@@ -83,7 +118,8 @@ pub enum BlockStatus {
     #[default]
     Free,
     Requested,
-    Received, //TODO Add writing, finished variants instead of Received
+    Writing,
+    Received,
 }
 
 impl PiecePicker {
@@ -109,8 +145,11 @@ impl PiecePicker {
             pieces.push(piece);
         }
 
+        let mut own_pieces = BitField::with_capacity(num_pieces as usize);
+        own_pieces.resize(num_pieces as usize, false);
+
         Self {
-            own_pieces: BitField::with_capacity(num_pieces as usize),
+            own_pieces: own_pieces,
             num_have: 0,
             missing_count: num_pieces,
             piece_size: piece_size,
@@ -125,6 +164,8 @@ impl PiecePicker {
         &self.own_pieces
     }
 
+    /// increases the peer count for the given piece
+    /// (is used when a BITFIELD message is received);
     /// Returns interested based on the whether we have the piece or not
     pub fn register_peer_pieces(&mut self, bitfield: &BitField) -> bool {
         assert!(self.pieces.len() <= bitfield.len());
@@ -147,6 +188,8 @@ impl PiecePicker {
         return interested;
     }
 
+    /// increases the peer count for the given piece
+    /// (is used when a HAVE message is received)
     pub fn register_peer_piece(&mut self, index: PieceIndex) -> bool {
         let mut interested = false;
 
@@ -159,26 +202,7 @@ impl PiecePicker {
         interested
     }
 
-    pub fn pick_piece(&mut self, peer_pieces: &BitField) -> Option<PieceIndex> {
-        // for piece_index in  self.own_pieces.iter_zeros() {
-        //     if let Some(h ) = peer_pieces.get(piece_index) {
-        //         if !*h {
-        //             continue;
-        //         }
-        //     }
-        // 	let piece = &mut self.pieces[piece_index];
-        // 	if piece.is_pending {
-        // 		continue;
-        // 	} else {
-        // 		piece.is_pending = true;
-        // 		self.free_count -= 1;
-        // 		return Some(piece_index);
-        // 	}
-        // }
-        return None;
-    }
-
-    /// Registers that we have received the piece
+    /// Registers that we have received the piece and hash passed
     ///
     /// # Panics
     ///
@@ -186,97 +210,168 @@ impl PiecePicker {
     pub fn received_piece(&mut self, index: PieceIndex) {
         tracing::trace!("Registering received piece: {}", index);
 
-        assert!(self.pieces.len() <= index);
-
-        let _ = self
-            .piece_downloads
-            .remove(&index)
-            .expect("Piece was not being downloaded");
+        assert!(index < self.pieces.len());
 
         let mut have_piece = &self.pieces[index];
 
         let piece = &mut self.pieces[index];
 
         piece.set_have();
+
+        self.own_pieces.set(index, true);
+        self.piece_downloads.remove(&index);
     }
 
     pub fn register_failed_piece(&mut self, index: PieceIndex) {
-        // self.own_pieces.set(index, false);
-        // self.pieces[index].is_pending = false;
-        // self.free_count -= 1;
+        self.own_pieces.set(index, false);
+        self.pieces[index].download_state = State::Open;
+        self.num_have -= 1;
+        self.missing_count += 1;
     }
 
+    /// pieces describes which pieces the peer we're requesting from has.
+	/// interesting_blocks is an out parameter, and will be filled with (up to)
+	/// num_blocks of interesting blocks that the peer has.
+	/// prefer_contiguous_blocks can be set if this peer should download whole
+	/// pieces rather than trying to download blocks from the same piece as other
+	/// peers. the peer argument is the torrent_peer of the peer we're
+	/// picking pieces from. This is used when downloading whole pieces, to only
+	/// pick from the same piece the same peer is downloading from.
+
+	/// options are:
+	/// * rarest_first
+	///     pick the rarest pieces first
+	/// * reverse
+	///     reverse the piece picking. Pick the most common
+	///     pieces first or the last pieces (if picking sequential)
+	/// * sequential
+	///     download pieces in-order
+	/// * on_parole
+	///     the peer is on parole, only pick whole pieces which
+	///     has only been downloaded and requested from the same
+	///     peer
+	/// * prioritize_partials
+	///     pick blocks from downloading pieces first
+
+	// only one of rarest_first or sequential can be set
+
+	// the return value is a combination of picker_flags_t,
+	// indicating which path thought the picker we took to arrive at the
+	// returned block picks.
     pub fn pick_pieces(
         &self,
         pieces: &BitField,
         interesting_blocks: &mut Vec<PieceBlock>,
         num_blocks: usize,
-        peer: SocketAddr,
+        peer: &SocketAddr,
         num_peers: usize,
     ) {
         let num_partials = self.piece_downloads.len();
-
+        let mut num_blocks = num_blocks;
         let prioritize_partials =
             num_partials > num_peers * 3 / 2 || num_partials * self.blocks_per_piece() > 2048;
 
         // Using rarest first approach
-
+        info!("prioritize_partials = {prioritize_partials}");
         if prioritize_partials {
             // Populates and filters acceptable pieces (i.e. remote peer has && we don't have)
             let mut ordered_partials: Vec<_> = self
                 .piece_downloads
                 .values()
-                .filter(|pd| self.is_piece_free(pd, pieces))
+                .filter(|pd| self.is_piece_free(pd.index, pieces))
                 .collect();
 
             // Sort by rarest
             ordered_partials.sort_by(|a, b| self.compare_rarest_first(a, b));
 
-            let mut num_blocks = num_blocks;
             for partial_piece in ordered_partials {
+                num_blocks = self.add_blocks_downloading(
+                    partial_piece,
+                    pieces,
+                    num_blocks,
+                    peer,
+                    interesting_blocks,
+                );
 
-                num_blocks = self.pick_blocks(partial_piece, pieces, num_blocks, &peer, interesting_blocks);
-
-                if num_blocks <= 0 {
+                if num_blocks == 0 {
                     return;
                 }
+            }
+        } else {
+            // Rarest first
+            let mut ordered_pieces = self.pieces.iter().collect::<Vec<_>>();
+            ordered_pieces.sort_by(|a, b| a.peer_count.cmp(&b.peer_count));
 
+            for piece in ordered_pieces {
+                if !self.is_piece_free(piece.index, pieces) {
+                    continue;
+                }
+                if piece.download_state == State::Downloading {
+                    let dp = self
+                        .piece_downloads
+                        .get(&piece.index)
+                        .expect("Downloading piece should be present");
+                    num_blocks = self.add_blocks_downloading(
+                        dp,
+                        pieces,
+                        num_blocks,
+                        peer,
+                        interesting_blocks,
+                    );
+                } else {
+                    let mut payload_blocks = self.blocks_in_piece(piece.index) as usize;
+
+                    if payload_blocks > num_blocks {
+                        payload_blocks = num_blocks;
+                    }
+
+                    for i in 0..payload_blocks {
+                        interesting_blocks.push(PieceBlock {
+                            piece_index: piece.index,
+                            block_index: i,
+                        });
+                    }
+                    num_blocks -= payload_blocks;
+                }
+
+                if num_blocks == 0 {
+                    return;
+                }
             }
         }
     }
 
-    fn pick_blocks(
+    fn add_blocks_downloading(
         &self,
         dp: &DownloadingPiece,
         pieces: &BitField,
         num_blocks: usize,
         peer: &SocketAddr,
-        interesting_blocks: &mut Vec<PieceBlock>
+        interesting_blocks: &mut Vec<PieceBlock>,
     ) -> usize {
         let num_blocks_in_piece = self.blocks_in_piece(dp.index);
         let mut num_blocks = num_blocks;
-
         let (exclusive, exclusive_active, contiguous_blocks, first_block) =
             self.requested_from(dp, num_blocks_in_piece, peer);
 
+        if let Some(dp) = self.piece_downloads.get(&dp.index) {
+            let blocks = &dp.blocks;
 
-        let blocks = &dp.blocks;
+            for (index, block) in blocks.iter().enumerate() {
+                if block.state != BlockStatus::Free {
+                    continue;
+                }
 
-        for (index, block) in blocks.iter().enumerate() {
-            if block.state != BlockStatus::Free {
-                continue;
+                interesting_blocks.push(PieceBlock {
+                    piece_index: dp.index,
+                    block_index: index,
+                });
+                num_blocks -= 1;
+
+                if num_blocks == 0 {
+                    return 0;
+                }
             }
-
-            interesting_blocks.push(PieceBlock { piece_index: dp.index, block_index: index });
-            num_blocks -= 1;
-
-            if num_blocks <= 0 {
-                return 0;
-            }
-        }
-
-        if num_blocks <= 0 {
-            return 0;
         }
 
         return num_blocks;
@@ -332,8 +427,8 @@ impl PiecePicker {
     }
 
     /// Whether the piece is free to be picked and the remote peer has it
-    fn is_piece_free(&self, piece: &DownloadingPiece, bitmask: &BitField) -> bool {
-        !self.own_pieces[piece.index] && bitmask[piece.index]
+    fn is_piece_free(&self, index: PieceIndex, bitmask: &BitField) -> bool {
+        !self.own_pieces[index] && bitmask[index]
     }
 
     /// lower availability comes first. This is a less than comparison, it returns true if lhs has lower availability than rhs
@@ -345,21 +440,276 @@ impl PiecePicker {
         }
 
         // if availability is the same, prefer the piece that's closest to being complete
-        let lhs_blocks = lhs.finished + lhs.requested; // TODO: + lhs.writing
-        let rhs_blocks = rhs.finished + rhs.requested; // TODO: + rhs.writing
+        let lhs_blocks = lhs.finished + lhs.writing + lhs.requested;
+        let rhs_blocks = rhs.finished + rhs.writing + rhs.requested;
 
         lhs_blocks.cmp(&rhs_blocks)
     }
 
     fn blocks_per_piece(&self) -> usize {
-        (self.piece_size + (BLOCK_LEN - 1) / BLOCK_LEN) as usize
+        ((self.piece_size + (BLOCK_LEN - 1)) / BLOCK_LEN) as usize
     }
 
-    fn blocks_in_piece(&self, index: PieceIndex) -> u32 {
+    pub fn blocks_in_piece(&self, index: PieceIndex) -> u32 {
         if index == self.pieces.len() - 1 {
             self.blocks_in_last_piece as u32
         } else {
             self.blocks_per_piece() as u32
         }
+    }
+
+    /// the number of pieces we want and don't have
+    pub fn num_left(&self) -> u32 {
+        self.pieces.len() as u32 - self.num_have
+    }
+
+    /// the number of peers this block has been requested from
+    pub fn num_peers(&self, block: &PieceBlock) -> usize {
+        if !self.pieces[block.piece_index].is_downloading() {
+            return 0;
+        }
+
+        if let Some(b) = self.piece_downloads.get(&block.piece_index) {
+            b.blocks[block.block_index].num_peers
+        } else {
+            0
+        }
+    }
+
+    /// returns false if the block could not be marked as downloading
+    pub fn mark_as_downloading(&mut self, block: &PieceBlock, peer: Option<SocketAddr>) -> bool {
+        let piece_index = block.piece_index;
+        if self.pieces[block.piece_index].download_state == State::Open {
+            self.pieces[block.piece_index].download_state = State::Downloading;
+
+            let dp = DownloadingPiece::new(
+                block.piece_index,
+                self.blocks_in_piece(block.piece_index) as usize,
+            );
+            assert!(self.piece_downloads.contains_key(&block.piece_index) == false);
+
+            let dp = self.piece_downloads.entry(block.piece_index).or_insert(dp);
+
+            let block = dp
+                .blocks
+                .get_mut(block.block_index)
+                .expect("Block should be present");
+
+            block.state = BlockStatus::Requested;
+            block.peer = peer;
+            block.num_peers = 1;
+
+            dp.requested += 1;
+
+            self.pieces[piece_index].download_state = dp.get_piece_state();
+        } else {
+            let mut dp = self
+                .piece_downloads
+                .get_mut(&block.piece_index)
+                .expect("Downloading Piece should be present");
+
+            let mut block = &mut dp.blocks[block.block_index];
+
+            if block.state == BlockStatus::Received || block.state == BlockStatus::Writing {
+                info!("Block: {:?} received or writing", block);
+                return false;
+            }
+
+            assert!(
+                (block.state == BlockStatus::Free || block.state == BlockStatus::Requested)
+                    && self.pieces[piece_index].peer_count > 0
+            );
+
+            block.peer = peer;
+            block.num_peers += 1;
+
+            if block.state != BlockStatus::Requested {
+                block.state = BlockStatus::Requested;
+
+                dp.requested += 1;
+
+                self.pieces[piece_index].download_state = dp.get_piece_state();
+            }
+        }
+
+        true
+    }
+
+    pub fn is_downloaded(&self, block: &PieceBlock) -> bool {
+        let piece = &self.pieces[block.piece_index];
+        if piece.download_state == State::Finished {
+            return true;
+        }
+
+        if let Some(dp) = self.piece_downloads.get(&block.piece_index) {
+            let b = &dp.blocks[block.block_index];
+            return b.state == BlockStatus::Writing || b.state == BlockStatus::Received;
+        }
+
+        return false;
+    }
+
+    /// this is called when a request is rejected or when
+    /// a peer disconnects. The piece might be in any state
+    pub fn abort_download(&mut self, block: &PieceBlock, peer: SocketAddr) {
+        let piece = &mut self.pieces[block.piece_index];
+        if piece.download_state == State::Open {
+            return;
+        }
+
+        let dp = self
+            .piece_downloads
+            .get_mut(&block.piece_index)
+            .expect("Piece should be in downloads");
+        let b = &mut dp.blocks[block.block_index];
+
+        if b.state == BlockStatus::Requested {
+            return;
+        }
+
+        if b.num_peers > 0 {
+            b.num_peers -= 1;
+        }
+
+        if Some(peer) == b.peer {
+            b.peer = None;
+        }
+
+        // if there are other peers, leave the block requested
+        if b.num_peers > 0 {
+            return;
+        }
+
+        b.peer = None;
+
+        // clear this block as being downloaded
+        b.state = BlockStatus::Free;
+        dp.requested -= 1;
+
+        // if there are no other blocks in this piece
+        // thats' being downloaded, remove it from the list
+        if dp.requested + dp.finished + dp.writing == 0 {
+            self.piece_downloads.remove(&block.piece_index);
+            return;
+        }
+        piece.download_state = dp.get_piece_state();
+    }
+
+    pub fn piece_size(&self, index: PieceIndex) -> u32 {
+        self.pieces[index].size
+    }
+
+    pub fn mark_as_writing(&mut self, block: &PieceBlock, peer: SocketAddr) -> bool {
+        let piece = &self.pieces[block.piece_index];
+
+        if piece.download_state != State::Downloading {
+            if piece.download_state == State::Finished {
+                return false;
+            }
+        }
+
+        let dp = self.piece_downloads.get_mut(&block.piece_index).unwrap();
+
+        let b = &mut dp.blocks[block.block_index];
+
+        b.peer = Some(peer);
+
+        if b.state == BlockStatus::Requested {
+            dp.requested -= 1;
+        }
+
+        if b.state == BlockStatus::Writing || b.state == BlockStatus::Received {
+            return false;
+        }
+
+        dp.writing += 1;
+        b.state = BlockStatus::Writing;
+
+        // all other requests for this block should have been cancelled now
+        b.num_peers = 0;
+
+        self.pieces[block.piece_index].download_state = dp.get_piece_state();
+
+        true
+    }
+
+    pub fn mark_as_finished(&mut self, block: &PieceBlock, peer: Option<SocketAddr>) {
+        if self.pieces[block.piece_index].download_state == State::Finished {
+            return;
+        }
+
+        //TODO: Handle the case where downloading piece is not found; that means we got the current
+        // block from somewhere (maybe it was available locally), Create a downloading piece
+        let dp = &mut self
+            .piece_downloads
+            .get_mut(&block.piece_index)
+            .expect("Downloading Piece should be present");
+        dp.finished += 1;
+        dp.requested -= 1;
+
+        let binfo = &mut dp.blocks[block.block_index];
+
+        binfo.peer = peer;
+
+        binfo.state = BlockStatus::Received;
+
+        self.pieces[block.piece_index].download_state = dp.get_piece_state();
+
+    }
+
+    pub fn is_requested(&self, pb: PieceBlock) -> bool {
+        let state = &self.pieces[pb.piece_index].download_state;
+        if *state == State::Open {
+            return false;
+        }
+
+        if let Some(dp) = self.piece_downloads.get(&pb.piece_index) {
+            return dp.blocks[pb.block_index].state == BlockStatus::Requested;
+        }
+        false
+    }
+
+    pub fn is_piece_finished(&self, piece: PieceIndex) -> bool {
+        todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, net::{Ipv4Addr, SocketAddrV4}};
+
+    use super::*;
+
+    const blocks_per_piece: u32 = 4;
+    const default_piece_size: u32 = blocks_per_piece * MAX_BLOCK_LEN;
+
+    #[test]
+    fn should_pick_all_pieces_one_by_one() {
+        let num_pieces = 10usize;
+
+        let mut p = PiecePicker::new(num_pieces as u64 * default_piece_size as u64, default_piece_size);
+
+        let available_pieces = BitField::repeat(true, num_pieces as usize);
+
+        p.register_peer_pieces(&available_pieces);
+        
+        let mut picked = HashSet::with_capacity(num_pieces as usize);
+        let peer = "127.0.0.1:8080".parse().unwrap();
+
+        loop {
+            let mut picked_blocks = Vec::new();
+            p.pick_pieces(&available_pieces, &mut picked_blocks, blocks_per_piece as usize, &peer, 1);
+
+            if picked_blocks.is_empty() {
+                break;
+            }
+
+            for b in picked_blocks.drain(..) {
+                p.mark_as_downloading(&b, None);
+                p.mark_as_finished(&b, None);
+                picked.insert(b.piece_index);
+            }
+        }
+        assert_eq!(picked.len(), num_pieces);
     }
 }

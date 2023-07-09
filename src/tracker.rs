@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use tracing::info;
-use reqwest;
 use serde::de;
 use serde::Deserialize;
 
