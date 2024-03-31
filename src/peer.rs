@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, bail, Ok, Result};
 use futures::{executor::block_on, stream::SplitSink, SinkExt, StreamExt};
 use sha1::digest::{block_buffer::Block, typenum::private::ShiftDiff};
 use tokio::{
@@ -99,6 +99,7 @@ pub struct SessionContext {
     pub in_slow_start: bool,
     pub in_end_game: bool,
     pub last_outgoing_request_time: Option<Instant>,
+    pub last_receive_time: Option<Instant>,
     /// the average time between incoming pieces. Or if there is no
     /// outstanding request, the time since the piece was requested. It
     /// is essentially an estimate of the time it will take to completely
@@ -116,6 +117,7 @@ impl Default for SessionContext {
             in_slow_start: true,
             in_end_game: false,
             last_outgoing_request_time: None,
+            last_receive_time: None,
             avg_request_time: Default::default(),
             snubbed: false,
         }
@@ -157,6 +159,8 @@ impl Default for SessionState {
 
 impl PeerSession {
     const TIMEOUT: Duration = Duration::from_secs(120);
+    const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn new(
@@ -188,7 +192,7 @@ impl PeerSession {
     pub async fn start_connection(&mut self) -> Result<()> {
         info!("Connecting to {}", self.peer.addr);
 
-        let socket = TcpStream::connect(self.peer.addr).await?;
+        let socket = tokio::time::timeout(Self::PEER_CONNECT_TIMEOUT, TcpStream::connect(self.peer.addr)).await??;
         info!(peer = self.repr, "TCP Socket Connected");
 
         let socket = Framed::new(socket, HandShakeCodec);
@@ -201,6 +205,9 @@ impl PeerSession {
         &mut self,
         mut socket: Framed<TcpStream, HandShakeCodec>,
     ) -> Result<()> {
+        let span = span!(tracing::Level::INFO, "Peer Handle connection" ,peer = %self.peer.addr);
+        let _guard = span.enter();
+
         let info_hash = self.torrent.info_hash;
         let handshake = HandShake::new(self.torrent.client_id, info_hash);
 
@@ -208,11 +215,12 @@ impl PeerSession {
 
         self.ctx.state.connection = ConnectionState::Handshaking;
         socket.send(handshake).await?;
-        info!(target: "outgoing_message", peer = self.repr, "Handshake sent");
+        info!("Handshake sent");
         self.ctx.last_outgoing_request_time = Some(Instant::now());
 
-        if let Some(peer_handshake) = socket.next().await {
-            info!(target: "incoming_message", "Packet received from peer. Should be handshake");
+        match tokio::time::timeout(Self::HANDSHAKE_TIMEOUT, socket.next()).await {
+         Result::Ok(Some(peer_handshake)) => {
+            info!("Packet received from peer. Should be handshake");
 
             let handshake = peer_handshake?;
             self.ctx.counters.protocol.down.add(handshake.len());
@@ -230,13 +238,18 @@ impl PeerSession {
 
             self.peer.id = Some(handshake.peer_id);
             self.ctx.state.connection = ConnectionState::AvailabilityExchange;
-        }
+        },
+        Result::Ok(None) => {
+            info!("Handshake hasn't received. Disconnecting");
+            bail!("Handshake not received")
+        },
+        Err(e) => {
+            info!("Handshake timeout. Disconnecting");
+            return Err(e.into());
+       }
+    }
 
-        let old_parts = socket.into_parts();
-        let mut socket = FramedParts::new(old_parts.io, MessageCodec);
-        socket.read_buf = old_parts.read_buf;
-        socket.write_buf = old_parts.write_buf;
-        let socket = Framed::from_parts(socket);
+        let socket = socket.map_codec(|_| MessageCodec);
 
         if let Err(e) = self.run(socket).await {
             return Err(e.context("Peer disconnected with error"));
@@ -590,7 +603,7 @@ impl PeerSession {
             let request_timeout = self.request_timeout();
 
             if !self.download_queue.is_empty() && since_last_request > request_timeout {
-                warn!(target: "peer_request_timeout", peer = self.repr, "Timeout after {} ms, cancelling {} request(s)",
+                warn!(target: "peer_request_timeout", peer = self.repr, "Timeout after {} ms, cancelling {} request(s) and snubbing peer",
                     since_last_request.as_millis(),
                     self.download_queue.len()
                 );
