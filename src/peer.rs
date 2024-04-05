@@ -99,7 +99,9 @@ pub struct SessionContext {
     pub in_slow_start: bool,
     pub in_end_game: bool,
     pub last_outgoing_request_time: Option<Instant>,
-    pub last_receive_time: Option<Instant>,
+    pub last_receive_time: Instant,
+    pub connect_time: Instant,
+    pub last_unchoked: Instant,// TODO implement disconnection when peer has not responded; In libtorrent, if the number of connections aren't too large, it doesn't bother to disconnect
     /// the average time between incoming pieces. Or if there is no
     /// outstanding request, the time since the piece was requested. It
     /// is essentially an estimate of the time it will take to completely
@@ -117,7 +119,9 @@ impl Default for SessionContext {
             in_slow_start: true,
             in_end_game: false,
             last_outgoing_request_time: None,
-            last_receive_time: None,
+            last_receive_time: Instant::now(),
+            last_unchoked: Instant::now(),
+            connect_time: Instant::now(),
             avg_request_time: Default::default(),
             snubbed: false,
         }
@@ -197,6 +201,8 @@ impl PeerSession {
 
         let socket = Framed::new(socket, HandShakeCodec);
         self.ctx.state.connection = ConnectionState::Connecting;
+        self.ctx.connect_time = Instant::now();
+        self.ctx.last_receive_time = self.ctx.connect_time;
 
         self.handle_connection(socket).await
     }
@@ -353,6 +359,7 @@ impl PeerSession {
                 if self.ctx.state.is_choked {
                     info!("Peer unchoked us");
                     self.ctx.state.is_choked = false;
+                    self.ctx.last_unchoked = Instant::now();
 
                     if self.ctx.state.is_interested {
                         self.pick_blocks().await;
@@ -587,6 +594,7 @@ impl PeerSession {
     ) -> Result<()> {
         trace!(target: "peer_connection_tick", peer = self.repr,
          request_in_flight = self.download_queue.len(), queue_size = self.ctx.desired_queue_size);
+
 
         if !self.ctx.state.is_choked {
             if self.ctx.state.is_interested
