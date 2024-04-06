@@ -202,7 +202,7 @@ impl PiecePicker {
         interested
     }
 
-    /// Registers that we have received the piece and hash passed
+    /// Registers that we have received the piece
     ///
     /// # Panics
     ///
@@ -211,8 +211,6 @@ impl PiecePicker {
         tracing::trace!("Registering received piece: {}", index);
 
         assert!(index < self.pieces.len());
-
-        let mut have_piece = &self.pieces[index];
 
         let piece = &mut self.pieces[index];
 
@@ -230,34 +228,34 @@ impl PiecePicker {
     }
 
     /// pieces describes which pieces the peer we're requesting from has.
-	/// interesting_blocks is an out parameter, and will be filled with (up to)
-	/// num_blocks of interesting blocks that the peer has.
-	/// prefer_contiguous_blocks can be set if this peer should download whole
-	/// pieces rather than trying to download blocks from the same piece as other
-	/// peers. the peer argument is the torrent_peer of the peer we're
-	/// picking pieces from. This is used when downloading whole pieces, to only
-	/// pick from the same piece the same peer is downloading from.
+    /// interesting_blocks is an out parameter, and will be filled with (up to)
+    /// num_blocks of interesting blocks that the peer has.
+    /// prefer_contiguous_blocks can be set if this peer should download whole
+    /// pieces rather than trying to download blocks from the same piece as other
+    /// peers. the peer argument is the torrent_peer of the peer we're
+    /// picking pieces from. This is used when downloading whole pieces, to only
+    /// pick from the same piece the same peer is downloading from.
 
-	/// options are:
-	/// * rarest_first
-	///     pick the rarest pieces first
-	/// * reverse
-	///     reverse the piece picking. Pick the most common
-	///     pieces first or the last pieces (if picking sequential)
-	/// * sequential
-	///     download pieces in-order
-	/// * on_parole
-	///     the peer is on parole, only pick whole pieces which
-	///     has only been downloaded and requested from the same
-	///     peer
-	/// * prioritize_partials
-	///     pick blocks from downloading pieces first
+    /// options are:
+    /// * rarest_first
+    ///     pick the rarest pieces first
+    /// * reverse
+    ///     reverse the piece picking. Pick the most common
+    ///     pieces first or the last pieces (if picking sequential)
+    /// * sequential
+    ///     download pieces in-order
+    /// * on_parole
+    ///     the peer is on parole, only pick whole pieces which
+    ///     has only been downloaded and requested from the same
+    ///     peer
+    /// * prioritize_partials
+    ///     pick blocks from downloading pieces first
 
-	// only one of rarest_first or sequential can be set
+    // only one of rarest_first or sequential can be set
 
-	// the return value is a combination of picker_flags_t,
-	// indicating which path thought the picker we took to arrive at the
-	// returned block picks.
+    // the return value is a combination of picker_flags_t,
+    // indicating which path thought the picker we took to arrive at the
+    // returned block picks.
     pub fn pick_pieces(
         &self,
         pieces: &BitField,
@@ -676,7 +674,7 @@ impl PiecePicker {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, net::{Ipv4Addr, SocketAddrV4}};
+    use std::collections::HashSet;
 
     use super::*;
 
@@ -687,18 +685,27 @@ mod tests {
     fn should_pick_all_pieces_one_by_one() {
         let num_pieces = 10usize;
 
-        let mut p = PiecePicker::new(num_pieces as u64 * default_piece_size as u64, default_piece_size);
+        let mut p = PiecePicker::new(
+            num_pieces as u64 * default_piece_size as u64,
+            default_piece_size,
+        );
 
         let available_pieces = BitField::repeat(true, num_pieces as usize);
 
         p.register_peer_pieces(&available_pieces);
-        
+
         let mut picked = HashSet::with_capacity(num_pieces as usize);
         let peer = "127.0.0.1:8080".parse().unwrap();
 
         loop {
             let mut picked_blocks = Vec::new();
-            p.pick_pieces(&available_pieces, &mut picked_blocks, blocks_per_piece as usize, &peer, 1);
+            p.pick_pieces(
+                &available_pieces,
+                &mut picked_blocks,
+                blocks_per_piece as usize,
+                &peer,
+                1,
+            );
 
             if picked_blocks.is_empty() {
                 break;
@@ -711,5 +718,26 @@ mod tests {
             }
         }
         assert_eq!(picked.len(), num_pieces);
+    }
+
+    #[test]
+    fn should_mark_piece_as_received() {
+        let num_pieces = 10usize;
+
+        let mut p = PiecePicker::new(
+            num_pieces as u64 * default_piece_size as u64,
+            default_piece_size,
+        );
+
+        let available_pieces = BitField::repeat(true, num_pieces as usize);
+
+        p.register_peer_pieces(&available_pieces);
+
+        // mark  pieces as received
+        let owned_pieces = [2, 5, 7];
+        for index in owned_pieces.iter() {
+            p.received_piece(*index);
+            assert!(p.own_pieces[*index]);
+        }
     }
 }

@@ -19,7 +19,7 @@ use tokio::{
     time,
 };
 use tokio_util::codec::{Framed, FramedParts};
-use tracing::{debug, info, span, trace, warn, Level, Span};
+use tracing::{Instrument, debug, info, span, trace, warn, Level, Span};
 
 use crate::{
     avg::SlidingAvg,
@@ -211,8 +211,7 @@ impl PeerSession {
         &mut self,
         mut socket: Framed<TcpStream, HandShakeCodec>,
     ) -> Result<()> {
-        let span = span!(tracing::Level::INFO, "Peer Handle connection" ,peer = %self.peer.addr);
-        let _guard = span.enter();
+        let span = span!(tracing::Level::INFO, "Peer Handle connection", peer = %self.peer.addr);
 
         let info_hash = self.torrent.info_hash;
         let handshake = HandShake::new(self.torrent.client_id, info_hash);
@@ -257,7 +256,7 @@ impl PeerSession {
 
         let socket = socket.map_codec(|_| MessageCodec);
 
-        if let Err(e) = self.run(socket).await {
+        if let Err(e) = self.run(socket).instrument(span).await {
             return Err(e.context("Peer disconnected with error"));
         }
 
@@ -957,8 +956,7 @@ impl PeerSession {
         &mut self,
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
     ) -> Result<()> {
-        let span = span!(Level::INFO, "Send block requests");
-        let _guard = span.enter();
+        info!("Send block requests");
 
         if self.download_queue.len() >= self.ctx.desired_queue_size {
             return Ok(());
@@ -967,6 +965,8 @@ impl PeerSession {
         let is_empty_download_queue: bool = self.download_queue.is_empty();
 
         let mut picker = self.torrent.piece_picker.write().await;
+
+        let mut messages = vec![];
 
         while !self.request_queue.is_empty()
             && self.download_queue.len() < self.ctx.desired_queue_size
@@ -996,9 +996,13 @@ impl PeerSession {
             self.download_queue.push_back(block);
 
             let message = Message::Request(block_request);
-            info!(target: "peer_connection:send_block_request", peer = ?self.peer.addr, msg = ?message);
-            sink.send(message).await?;
+            trace!("Block request message {:?}", message);
+            messages.push(message);
         }
+        
+        info!("Sending block requests: {}", messages.len());
+        let mut stream = futures::stream::iter(messages.into_iter().map(Ok));
+        sink.send_all(&mut stream).await?;
 
         if !self.download_queue.is_empty() && is_empty_download_queue {
             // This means we just added a request to this connection that
