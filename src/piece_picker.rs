@@ -14,6 +14,15 @@ pub struct PieceBlock {
     pub block_index: usize,
 }
 
+impl From<(usize, usize)> for PieceBlock {
+    fn from((piece, block): (usize, usize)) -> Self {
+        Self {
+            piece_index: piece,
+            block_index: block,
+        }
+    }
+}
+
 pub struct PiecePicker {
     pub own_pieces: BitField,
     pub piece_size: u32,
@@ -107,7 +116,7 @@ impl DownloadingPiece {
 pub struct BlockInfo {
     /// the peer this block was requested or downloaded from
     pub peer: Option<SocketAddr>,
-    /// the number of peers that has this block in their download queues
+    /// the number of peers that has this block in their download or request queues
     pub num_peers: usize,
     /// the state of this block
     pub state: BlockStatus,
@@ -514,8 +523,8 @@ impl PiecePicker {
             }
 
             assert!(
-                (block.state == BlockStatus::Free || block.state == BlockStatus::Requested)
-                    && self.pieces[piece_index].peer_count > 0
+                block.state == BlockStatus::Free
+                    || (block.state == BlockStatus::Requested && block.num_peers > 0)
             );
 
             block.peer = peer;
@@ -549,7 +558,7 @@ impl PiecePicker {
 
     /// this is called when a request is rejected or when
     /// a peer disconnects. The piece might be in any state
-    pub fn abort_download(&mut self, block: &PieceBlock, peer: SocketAddr) {
+    pub fn abort_download(&mut self, block: &PieceBlock, peer: &SocketAddr) {
         let piece = &mut self.pieces[block.piece_index];
         if piece.download_state == State::Open {
             return;
@@ -559,9 +568,10 @@ impl PiecePicker {
             .piece_downloads
             .get_mut(&block.piece_index)
             .expect("Piece should be in downloads");
+
         let b = &mut dp.blocks[block.block_index];
 
-        if b.state == BlockStatus::Requested {
+        if b.state != BlockStatus::Requested {
             return;
         }
 
@@ -569,7 +579,7 @@ impl PiecePicker {
             b.num_peers -= 1;
         }
 
-        if Some(peer) == b.peer {
+        if Some(peer) == b.peer.as_ref() {
             b.peer = None;
         }
 
@@ -584,13 +594,14 @@ impl PiecePicker {
         b.state = BlockStatus::Free;
         dp.requested -= 1;
 
+        piece.download_state = dp.get_piece_state();
+
         // if there are no other blocks in this piece
         // thats' being downloaded, remove it from the list
         if dp.requested + dp.finished + dp.writing == 0 {
             self.piece_downloads.remove(&block.piece_index);
             return;
         }
-        piece.download_state = dp.get_piece_state();
     }
 
     pub fn piece_size(&self, index: PieceIndex) -> u32 {
@@ -652,10 +663,9 @@ impl PiecePicker {
         binfo.state = BlockStatus::Received;
 
         self.pieces[block.piece_index].download_state = dp.get_piece_state();
-
     }
 
-    pub fn is_requested(&self, pb: PieceBlock) -> bool {
+    pub fn is_requested(&self, pb: &PieceBlock) -> bool {
         let state = &self.pieces[pb.piece_index].download_state;
         if *state == State::Open {
             return false;
@@ -674,12 +684,18 @@ impl PiecePicker {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        net::{Ipv4Addr, SocketAddrV4},
+    };
+
+    use crate::peer;
 
     use super::*;
 
     const blocks_per_piece: u32 = 4;
     const default_piece_size: u32 = blocks_per_piece * MAX_BLOCK_LEN;
+    const peer0: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
 
     #[test]
     fn should_pick_all_pieces_one_by_one() {
@@ -695,7 +711,6 @@ mod tests {
         p.register_peer_pieces(&available_pieces);
 
         let mut picked = HashSet::with_capacity(num_pieces as usize);
-        let peer = "127.0.0.1:8080".parse().unwrap();
 
         loop {
             let mut picked_blocks = Vec::new();
@@ -703,7 +718,7 @@ mod tests {
                 &available_pieces,
                 &mut picked_blocks,
                 blocks_per_piece as usize,
-                &peer,
+                &peer0,
                 1,
             );
 
@@ -739,5 +754,130 @@ mod tests {
             p.received_piece(*index);
             assert!(p.own_pieces[*index]);
         }
+    }
+
+    #[test]
+    fn should_abort_download() {
+        let num_pieces = 10usize;
+
+        let mut p = PiecePicker::new(
+            num_pieces as u64 * default_piece_size as u64,
+            default_piece_size,
+        );
+
+        let mut available_pieces = BitField::repeat(false, num_pieces as usize);
+        available_pieces.set(0, true);
+        available_pieces.set(1, true);
+        available_pieces.set(2, true);
+
+        let mut picked_pieces = Vec::new();
+
+        let pb0 = (0, 0).into();
+        let pb1 = (0, 1).into();
+
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(picked_pieces.contains(&pb0));
+
+        p.abort_download(&pb0, &peer0);
+
+        picked_pieces.clear();
+
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(picked_pieces.contains(&pb0));
+
+        picked_pieces.clear();
+
+        p.mark_as_downloading(&pb0, Some(peer0.clone()));
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == true);
+        assert!(!picked_pieces.contains(&pb0));
+
+        picked_pieces.clear();
+
+        p.abort_download(&pb0, &peer0);
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(picked_pieces.contains(&pb0));
+
+        picked_pieces.clear();
+
+        p.mark_as_downloading(&pb0, Some(peer0.clone()));
+        p.mark_as_downloading(&pb1, Some(peer0.clone()));
+        p.abort_download(&pb0, &peer0);
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(picked_pieces.contains(&pb0));
+
+        picked_pieces.clear();
+
+        p.mark_as_downloading(&pb0, Some(peer0.clone()));
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(picked_pieces.contains(&(1, 0).into()) || picked_pieces.contains(&(2, 0).into()));
+
+        picked_pieces.clear();
+
+        p.abort_download(&pb0, &peer0);
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(picked_pieces.contains(&pb0));
+
+        picked_pieces.clear();
+
+        p.mark_as_downloading(&pb0, Some(peer0.clone()));
+        p.mark_as_finished(&pb0, Some(peer0.clone()));
+        p.abort_download(&pb0, &peer0);
+        p.pick_pieces(
+            &available_pieces,
+            &mut picked_pieces,
+            self::blocks_per_piece as usize,
+            &peer0,
+            1,
+        );
+        assert!(p.is_requested(&pb0) == false);
+        assert!(!picked_pieces.contains(&pb0));
     }
 }

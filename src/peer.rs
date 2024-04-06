@@ -648,7 +648,7 @@ impl PeerSession {
 
         // wipe unsent requests
         for b in self.request_queue.drain(..) {
-            picker.abort_download(&b.block, self.peer.addr);
+            picker.abort_download(&b.block, &self.peer.addr);
         }
         drop(picker);
 
@@ -697,7 +697,7 @@ impl PeerSession {
                 .piece_picker
                 .write()
                 .await
-                .abort_download(&r, self.peer.addr);
+                .abort_download(&r, &self.peer.addr);
         }
 
         self.send_block_requests(sink).await?;
@@ -978,7 +978,7 @@ impl PeerSession {
 
             // this can happen if a block times out, is req-requested and then arrives "unexpectedly"
             if picker.is_downloaded(&block.block) {
-                picker.abort_download(&block.block, self.peer.addr);
+                picker.abort_download(&block.block, &self.peer.addr);
                 continue;
             }
 
@@ -1022,7 +1022,7 @@ impl PeerSession {
 
         let mut picker = self.torrent.piece_picker.write().await;
 
-        if !picker.is_requested(pb) {
+        if !picker.is_requested(&pb) {
             return Ok(());
         }
 
@@ -1043,7 +1043,7 @@ impl PeerSession {
                 length: block_size,
             };
 
-            picker.abort_download(&b.block, self.peer.addr);
+            picker.abort_download(&b.block, &self.peer.addr);
 
             let msg = Message::Cancel(block_request);
             sink.send(msg).await?;
@@ -1053,7 +1053,7 @@ impl PeerSession {
             .enumerate()
             .find(|(_, p)| p.block == pb)
         {
-            picker.abort_download(&b.block, self.peer.addr);
+            picker.abort_download(&b.block, &self.peer.addr);
             self.request_queue.remove(i);
         }
 
