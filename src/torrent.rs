@@ -89,7 +89,7 @@ impl TorrentInfo {
         let num_pieces = meta_info.info.pieces.len() / 20;
         let piece_length = meta_info.info.piece_length;
         // Considering single file mode
-        let length = meta_info.info.length.unwrap();
+        let length = meta_info.torrent_len();
         debug_assert_eq!(
             (length as f32 / meta_info.info.piece_length as f32).ceil() as usize,
             num_pieces
@@ -104,7 +104,7 @@ impl TorrentInfo {
             temp_sha1.copy_to_slice(&mut piece_sha1);
 
             let p_len = if index == (num_pieces - 1) {
-                (length - ((num_pieces - 1) as u32 * piece_length) as i64) as u32
+                (length - ((num_pieces - 1) as u32 * piece_length) as u64) as u32
             } else {
                 piece_length
             };
@@ -218,6 +218,7 @@ impl Torrent {
             self.torrent.torrent.metainfo.info.name.to_owned(),
             self.torrent.torrent.metainfo.info.pieces.clone().into_vec(),
             self.torrent.storage.clone(),
+            self.torrent.torrent.metainfo.info.files.clone()
         );
 
         let handle = tokio::spawn(async move { storage.start().await });

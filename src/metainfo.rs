@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
+use tracing::info;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -18,6 +19,8 @@ pub struct File {
     pub length: u64,
     #[serde(default)]
     pub md5sum: Option<String>,
+    #[serde(default)]
+    pub offset: u64
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -82,6 +85,10 @@ impl MetaInfo {
         result.into()
     }
 
+    pub fn is_multifile(&self) -> bool {
+        self.info.files.is_some()
+    }
+
     pub fn torrent_len(&self) -> u64 {
         if let Some(files) = &self.info.files {
             return files.iter().map(|f| f.length).sum();
@@ -97,6 +104,63 @@ pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {
     let mut f = fs::File::open(path.as_ref())?;
     let _ = f.read_to_end(&mut bytes)?;
 
-    let deserialized: MetaInfo = serde_bencode::from_bytes(bytes.as_slice())?;
+    let mut deserialized: MetaInfo = serde_bencode::from_bytes(bytes.as_slice())?;
+    println!("{:?}", deserialized);
+
+    if let Some(files) = &mut deserialized.info.files {
+        let mut offset = 0;
+
+        for f in files {
+            f.offset = offset;
+            offset += f.length;
+        }
+    }
+    
     Ok(deserialized)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn test_read_multi_file() {
+        let t_path = "tests/test_torrents/sample-multi-file.torrent";
+
+        let t = read_torrent_file(t_path);
+        assert!(t.is_ok(), "{}", t.unwrap_err());
+        
+        let metainfo = t.unwrap();
+
+        assert!(metainfo.info.files.is_some());
+
+        assert!(metainfo.is_multifile());
+
+        assert!(&metainfo.is_multifile());
+
+        let files = metainfo.info.files.as_ref().unwrap();
+
+        assert!(files.len() > 1);
+
+        let torrent_files = ["text_file2.txt", ".____padding_file/0", "text_file.txt"];
+
+        let a = files.iter().map(|f| PathBuf::from_iter(f.path.iter()).into_os_string().into_string().unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(torrent_files, a.as_slice());
+
+    }
+
+    #[test]
+    fn test_multi_file() {
+
+        let t_path = "multi-file.torrent";
+
+        let t = read_torrent_file(t_path).unwrap();
+
+        println!("{:?}", t);
+        
+    }
 }

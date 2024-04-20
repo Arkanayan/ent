@@ -1,19 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use sha1::{Digest, Sha1};
 
-
-use tokio::sync::mpsc::{
-    unbounded_channel, UnboundedReceiver, UnboundedSender,
-};
-use tokio::task::{JoinHandle, spawn_blocking};
-use tokio::{select, fs};
 use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace, info};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::{spawn_blocking, JoinHandle};
+use tokio::{fs, select, fs::File, io::BufWriter};
+use tracing::{debug, info, trace};
 
+use crate::metainfo;
 use crate::piece_picker::PieceBlock;
 use crate::units::block_count;
 use crate::{storage::StorageInfo, torrent::BlockInfo, units::PieceIndex};
@@ -58,13 +57,17 @@ pub struct DiskComm {
 
 #[derive(Debug)]
 pub struct DiskStorage {
-    filename: String,
+    /// filename in case of single file torrent
+    /// parent directory name in case of multi file
+    name: String,
     hashes: Vec<u8>,
     info: StorageInfo,
     pieces: HashMap<PieceIndex, Piece>,
     cmd_rx: CommandReceiver,
     alert_tx: AlertSender,
-    missing_count: usize
+    missing_count: usize,
+    files: Option<Vec<metainfo::File>>,
+    buffers: HashMap<String, BufWriter<File>>
 }
 
 impl DiskStorage {
@@ -72,29 +75,34 @@ impl DiskStorage {
         filename: String,
         hashes: Vec<u8>,
         info: StorageInfo,
+        files: Option<Vec<metainfo::File>>,
     ) -> (Self, CommandSender, AlertReceiver) {
         let (tx, rx) = unbounded_channel();
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let missing_pieces_count = info.piece_count;
         (
             Self {
-                filename,
+                name: filename,
                 hashes,
                 info,
                 pieces: HashMap::new(),
                 cmd_rx,
                 alert_tx: tx,
-                missing_count: missing_pieces_count
+                missing_count: missing_pieces_count,
+                files: files,
+                buffers: HashMap::new()
             },
             cmd_tx,
             rx,
         )
     }
 
+    fn is_multifile(&self) -> bool {
+        self.files.is_some()
+    }
+
     pub async fn start(mut self) -> Result<()> {
         trace!("Starting Disk Thread");
-        let f = fs::OpenOptions::new().create(true).read(true).write(true).open(&self.filename).await?;
-        let mut buf = tokio::io::BufWriter::new(f);
 
         loop {
             select! {
@@ -102,11 +110,11 @@ impl DiskStorage {
                     match cmd {
                         Command::WriteBlock(block_info, bytes) => {
                             trace!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
-                            self.write_block(&mut buf, block_info, bytes).await;
+                            self.write_block(block_info, bytes).await;
                         },
                         Command::Shutdown => {
                             info!("Shutting down disk storage");
-                            buf.flush().await.ok();
+                            self.flush_buffers().await?;
                             return Ok(());
                         }
                     }
@@ -115,13 +123,14 @@ impl DiskStorage {
         }
     }
 
-    async fn write_block<F: AsyncSeek + AsyncWrite + Unpin>(&mut self, file: &mut F,block_info: BlockInfo, data: Vec<u8>) {
+    async fn write_block(
+        &mut self,
+        block_info: BlockInfo,
+        data: Vec<u8>,
+    ) {
         let piece_index = block_info.piece_index();
         if let Some(piece) = self.pieces.get_mut(&block_info.piece_index) {
-            if piece
-                .blocks
-                .contains_key(&block_info.offset)
-            {
+            if piece.blocks.contains_key(&block_info.offset) {
                 debug!(
                     "Duplicate block download: Piece: {} Block in piece: {}",
                     block_info.piece_index,
@@ -129,9 +138,7 @@ impl DiskStorage {
                 );
                 return;
             }
-            piece
-                .blocks
-                .insert(block_info.offset, data);
+            piece.blocks.insert(block_info.offset, data);
         } else {
             let piece_len = if block_info.piece_index() == (self.info.piece_count - 1) {
                 self.info.last_piece_len
@@ -140,7 +147,7 @@ impl DiskStorage {
             };
 
             let mut piece_hash = [0u8; 20];
-            piece_hash.copy_from_slice(&self.hashes[piece_index*20..piece_index*20+20]);
+            piece_hash.copy_from_slice(&self.hashes[piece_index * 20..piece_index * 20 + 20]);
 
             let mut piece = Piece {
                 len: piece_len,
@@ -157,16 +164,20 @@ impl DiskStorage {
             let mut piece = self.pieces.remove(&piece_index).expect("Piece not found");
             let alert_tx = self.alert_tx.clone();
 
-            let (verified, piece) = spawn_blocking(move || {
-                (piece.verify_hash(), piece)
-            }).await.expect("Hash calculation error");
+            let (verified, piece) = spawn_blocking(move || (piece.verify_hash(), piece))
+                .await
+                .expect("Hash calculation error");
 
             if verified {
                 self.missing_count -= 1;
-                let file_start = piece_index * piece.len as usize;
-                file.seek(io::SeekFrom::Start(file_start as u64)).await.ok();
+                let offset = piece_index as u64 * piece.len as u64;
+
+                let (filename, relative_offset) = self.get_filename(offset);
+                let buffer = self.get_file_buffer(&filename).await;
+                buffer.seek(io::SeekFrom::Start(relative_offset as u64)).await.ok();
+
                 for b in piece.blocks.into_values() {
-                    file.write_all(b.as_slice()).await.ok();
+                    buffer.write_all(b.as_slice()).await.ok();
                 }
                 alert_tx.send(Alert::PieceCompletion(piece_index)).ok();
             } else {
@@ -176,9 +187,63 @@ impl DiskStorage {
             if self.missing_count == 0 {
                 alert_tx.send(Alert::TorrentCompletion).ok();
             }
-
         }
+    }
+
+    fn get_filename(&self, offset: u64) -> (PathBuf, u64) {
         
+        if !self.is_multifile() {
+            return (PathBuf::from(self.name.as_str()), offset);
+        }
+
+        let files = self.files.as_ref().unwrap();
+
+        let mut idx = 0;
+
+        for (i, f) in files.iter().enumerate() {
+
+            if offset < f.offset {
+                idx = i;
+            } else {
+                break;
+            }
+        }
+        let mut p = PathBuf::from(self.name.as_str());
+        p.extend(files[idx].path.iter());
+        (p, offset - files[idx].offset)
+    }
+
+    async fn get_file_buffer(&mut self, file_path: &Path) -> &mut BufWriter<File> {
+
+        if self.buffers.contains_key(file_path.to_str().unwrap()) {
+            // return &mut self.buffers[file_path.to_str().unwrap()];
+            return self.buffers.get_mut(file_path.to_str().unwrap()).unwrap();
+        }
+
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(file_path)
+            .await.unwrap();
+
+        let buf = tokio::io::BufWriter::new(f);
+
+        self.buffers.insert(file_path.to_str().unwrap().to_owned(), buf);
+
+        self.buffers.get_mut(file_path.to_str().unwrap()).unwrap()
+    }
+
+    async fn flush_buffers(&mut self) -> io::Result<()> {
+
+        for (_, mut b) in self.buffers.drain() {
+            b.flush().await?;
+        }
+        Ok(()) 
     }
 }
 

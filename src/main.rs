@@ -35,8 +35,14 @@ async fn main() -> Result<()> {
     // let meta_info = metainfo::read_torrent_file("ubuntu-22-10.torrent")?;
     // let meta_info = metainfo::read_torrent_file("debian-12.5.torrent")?;
     let meta_info = metainfo::read_torrent_file("debian.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("multi-file.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("slackware-14.2-install-d1.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("test-academic.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("slackware-14.2-install-d3.torrent")?;
     // info!("{}", t.info.pieces.len());
+    info!("Getting peer details from tracker");
     let tracker_data = tracker::get_peer_details_from_tracker(&meta_info, &PEER_ID).await?;
+    println!("{:?}", tracker_data);
     info!(target: "main", peers = ?tracker_data.peers);
 
     let torrent_info = TorrentInfo::new(&meta_info, &tracker_data);
