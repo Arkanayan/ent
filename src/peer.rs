@@ -407,7 +407,7 @@ impl PeerSession {
 
                 if make_requests {
                     if self.pick_blocks().await {
-                        self.send_block_requests(sink).await;
+                        self.send_block_requests(sink).await?;
                     }
                 }
             }
@@ -835,7 +835,7 @@ impl PeerSession {
             num_peers,
         );
 
-        info!(target: "peer_connection:pick_blocks", num_blocks_picked = interesting_pieces.len());
+        info!(target: "peer::connection:pick_blocks", num_blocks_picked = interesting_pieces.len(), picks = ?interesting_pieces);
 
         let strict_end_game_mode = true; // TODO - Move it into a config
 
@@ -846,7 +846,6 @@ impl PeerSession {
         let dont_pick_busy_blocks = (strict_end_game_mode
             && (picker.piece_downloads.len() as u32) < picker.num_left())
             || self.download_queue.len() + self.request_queue.len() > 0;
-
         // this is filled with an interesting piece that some other peer is currently downloading
         let mut busy_block = None;
 
@@ -881,8 +880,9 @@ impl PeerSession {
             // if self.download_queue.contains(pb) || self.request_queue.contains(pb) {
             //     continue;
             // }
-            info!("Adding block request: {pb:?} ");
+            trace!("Adding block request: {pb:?} ");
             if !self.add_request(&pb, &mut picker, false).await {
+                info!("Unable to add to request queue {pb:?}");
                 continue;
             }
             assert_eq!(picker.num_peers(pb), 1);
@@ -924,6 +924,7 @@ impl PeerSession {
     /// adds a block to the request queue
     /// returns true if successful otherwise false
     async fn add_request(&mut self, pb: &PieceBlock, picker: &mut PiecePicker, busy: bool) -> bool {
+        debug!("Adding request {pb:?}");
         if self.ctx.state.connection == ConnectionState::Disconnected {
             return false;
         }
@@ -935,7 +936,7 @@ impl PeerSession {
             if self.download_queue.iter().any(|pb| pb.busy)
                 || self.request_queue.iter().any(|pb| pb.busy)
             {
-                info!(target: "piece_picker", "not_picking: busy block already exists");
+                info!(target: "ent::peer::add_request", "not_picking: busy block already exists");
                 return false;
             }
         }
@@ -957,7 +958,7 @@ impl PeerSession {
         &mut self,
         sink: &mut SplitSink<Framed<TcpStream, MessageCodec>, Message>,
     ) -> Result<()> {
-        info!("Send block requests");
+        info!(target: "ent::peer::send_block_requests", request_queue_len = self.request_queue.len());
 
         if self.download_queue.len() >= self.ctx.desired_queue_size {
             return Ok(());
@@ -969,7 +970,7 @@ impl PeerSession {
 
         let mut messages = vec![];
 
-        info!("Request queue size: {}", self.request_queue.len());
+        // info!("Request queue size: {}", self.request_queue.len());
 
         while !self.request_queue.is_empty()
             && self.download_queue.len() < self.ctx.desired_queue_size
