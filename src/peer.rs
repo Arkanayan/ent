@@ -478,7 +478,7 @@ impl PeerSession {
         self.download_queue.remove(idx);
 
         self.disk_tx
-            .send(disk::Command::WriteBlock(block_info.clone(), data.into()))
+            .send(disk::Command::WriteBlock(block_finished, data.into()))
             .ok();
 
         let multi = picker.num_peers(&block_finished) > 1;
@@ -847,7 +847,7 @@ impl PeerSession {
             && (picker.piece_downloads.len() as u32) < picker.num_left())
             || self.download_queue.len() + self.request_queue.len() > 0;
 
-        // this is filled with an interesting piece that some toher peer is currently downloading
+        // this is filled with an interesting piece that some other peer is currently downloading
         let mut busy_block = None;
 
         let mut num_blocks_picked = interesting_pieces.len() as i32;
@@ -910,6 +910,7 @@ impl PeerSession {
             return true;
         }
 
+        info!("Adding busy block: {busy_block:?} ");
         self.add_request(
             busy_block.expect("busy block should not be None"),
             &mut picker,
@@ -967,6 +968,8 @@ impl PeerSession {
         let mut picker = self.torrent.piece_picker.write().await;
 
         let mut messages = vec![];
+
+        info!("Request queue size: {}", self.request_queue.len());
 
         while !self.request_queue.is_empty()
             && self.download_queue.len() < self.ctx.desired_queue_size

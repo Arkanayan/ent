@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
     // let meta_info = metainfo::read_torrent_file("slackware-14.2-install-d1.torrent")?;
     // let meta_info = metainfo::read_torrent_file("test-academic.torrent")?;
     // let meta_info = metainfo::read_torrent_file("slackware-14.2-install-d3.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("nord-osmosis.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("billy-multi-file.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("imp.torrent")?;
     // info!("{}", t.info.pieces.len());
     info!("Getting peer details from tracker");
     let tracker_data = tracker::get_peer_details_from_tracker(&meta_info, &PEER_ID).await?;

@@ -108,9 +108,9 @@ impl DiskStorage {
             select! {
                Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
-                        Command::WriteBlock(block_info, bytes) => {
-                            trace!("Received block. Piece: {}, block offset: {}, size: {}", block_info.piece_index, block_info.offset, bytes.len());
-                            self.write_block(block_info, bytes).await;
+                        Command::WriteBlock(pb, bytes) => {
+                            trace!("Received block. Piece: {}, Block: {}, size: {}", pb.piece_index, pb.block_index, bytes.len());
+                            self.write_block(pb, bytes).await;
                         },
                         Command::Shutdown => {
                             info!("Shutting down disk storage");
@@ -125,26 +125,23 @@ impl DiskStorage {
 
     async fn write_block(
         &mut self,
-        block_info: BlockInfo,
+        pb: PieceBlock,
         data: Vec<u8>,
     ) {
-        let piece_index = block_info.piece_index();
-        if let Some(piece) = self.pieces.get_mut(&block_info.piece_index) {
-            if piece.blocks.contains_key(&block_info.offset) {
+        let piece_index = pb.piece_index;
+        let block_offset = self.info.get_offset_in_piece(&pb);
+        if let Some(piece) = self.pieces.get_mut(&pb.piece_index) {
+            if piece.blocks.contains_key(&block_offset) {
                 debug!(
                     "Duplicate block download: Piece: {} Block in piece: {}",
-                    block_info.piece_index,
-                    block_info.index_in_piece()
+                    pb.piece_index,
+                    pb.block_index
                 );
                 return;
             }
-            piece.blocks.insert(block_info.offset, data);
+            piece.blocks.insert(block_offset, data);
         } else {
-            let piece_len = if block_info.piece_index() == (self.info.piece_count - 1) {
-                self.info.last_piece_len
-            } else {
-                self.info.piece_len
-            };
+            let piece_len = self.info.piece_len(&pb);
 
             let mut piece_hash = [0u8; 20];
             piece_hash.copy_from_slice(&self.hashes[piece_index * 20..piece_index * 20 + 20]);
@@ -154,7 +151,7 @@ impl DiskStorage {
                 blocks: BTreeMap::new(),
                 expected_hash: piece_hash,
             };
-            piece.blocks.insert(block_info.offset, data);
+            piece.blocks.insert(block_offset, data);
             self.pieces.insert(piece_index, piece);
         }
 
@@ -252,7 +249,7 @@ pub type CommandReceiver = UnboundedReceiver<Command>;
 
 #[derive(Debug)]
 pub enum Command {
-    WriteBlock(BlockInfo, Vec<u8>),
+    WriteBlock(PieceBlock, Vec<u8>),
     Shutdown,
 }
 
