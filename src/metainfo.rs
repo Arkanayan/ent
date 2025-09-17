@@ -2,11 +2,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
-use tracing::info;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-
+use tracing::info;
 
 pub type PeerID = [u8; 20];
 
@@ -20,7 +19,7 @@ pub struct File {
     #[serde(default)]
     pub md5sum: Option<String>,
     #[serde(default)]
-    pub offset: u64
+    pub offset: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -96,7 +95,6 @@ impl MetaInfo {
 
         self.info.length.unwrap() as u64
     }
-
 }
 
 pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {
@@ -105,7 +103,6 @@ pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {
     let _ = f.read_to_end(&mut bytes)?;
 
     let mut deserialized: MetaInfo = serde_bencode::from_bytes(bytes.as_slice())?;
-    println!("{:?}", deserialized);
 
     if let Some(files) = &mut deserialized.info.files {
         let mut offset = 0;
@@ -115,7 +112,7 @@ pub fn read_torrent_file<T: AsRef<Path>>(path: T) -> Result<MetaInfo> {
             offset += f.length;
         }
     }
-    
+
     Ok(deserialized)
 }
 
@@ -132,7 +129,7 @@ mod tests {
 
         let t = read_torrent_file(t_path);
         assert!(t.is_ok(), "{}", t.unwrap_err());
-        
+
         let metainfo = t.unwrap();
 
         assert!(metainfo.info.files.is_some());
@@ -147,20 +144,26 @@ mod tests {
 
         let torrent_files = ["text_file2.txt", ".____padding_file/0", "text_file.txt"];
 
-        let a = files.iter().map(|f| PathBuf::from_iter(f.path.iter()).into_os_string().into_string().unwrap()).collect::<Vec<_>>();
+        let a = files
+            .iter()
+            .map(|f| {
+                PathBuf::from_iter(f.path.iter())
+                    .into_os_string()
+                    .into_string()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(torrent_files, a.as_slice());
-
     }
 
     #[test]
     fn test_multi_file() {
-
         let t_path = "multi-file.torrent";
 
         let t = read_torrent_file(t_path).unwrap();
 
         println!("{:?}", t);
-        
     }
 }
+

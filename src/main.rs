@@ -1,30 +1,35 @@
 use anyhow::Result;
-use std::str;
+use std::{fmt::Debug, str};
 
-use once_cell::sync::{Lazy};
+use once_cell::sync::Lazy;
 
-use rand::{thread_rng, distributions::Alphanumeric, Rng, seq::SliceRandom};
-use torrent::{TorrentInfo, Torrent};
+use rand::{distributions::Alphanumeric, seq::SliceRandom, thread_rng, Rng};
+use torrent::{Torrent, TorrentInfo};
 use tracing::info;
 
-mod metainfo;
-mod tracker;
+mod avg;
 mod connection;
-mod protocol;
+mod dht;
+mod disk;
+mod download;
 mod messages;
-mod torrent;
+mod metainfo;
 mod peer;
 mod piece_picker;
-mod storage;
-mod units;
-mod download;
-mod disk;
+mod protocol;
 mod stat;
-mod avg;
-
+mod storage;
+mod torrent;
+mod tracker;
+mod units;
 
 static PEER_ID: Lazy<metainfo::PeerID> = Lazy::new(|| {
-    thread_rng().sample_iter(&Alphanumeric).take(20).collect::<Vec<_>>().try_into().unwrap()
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(20)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
 });
 
 #[tokio::main]
@@ -32,7 +37,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("PEER_ID: {}", str::from_utf8(PEER_ID.as_ref()).unwrap());
-    // let meta_info = metainfo::read_torrent_file("ubuntu-22-10.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("ubuntu-22.10-server.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("ubuntu-24.04-server.torrent")?;
+    // let meta_info = metainfo::read_torrent_file("ubuntu-24.04-desktop.torrent")?;
     // let meta_info = metainfo::read_torrent_file("debian-12.5.torrent")?;
     let meta_info = metainfo::read_torrent_file("debian.torrent")?;
     // let meta_info = metainfo::read_torrent_file("multi-file.torrent")?;
@@ -57,9 +64,13 @@ async fn main() -> Result<()> {
     };
 
     let mut torrent = Torrent::new(torrent_info, *PEER_ID);
-    torrent.start().await?;
+
+    // futures::try_join!(torrent.start(), dht::start_dht_node())?;
+    // torrent.start().await?;
     // let mut peer_session = PeerSession::new(torrent_info.clone(), peer.clone());
     // peer_session.start_connection(*PEER_ID).await?;
+
+    dht::start_dht_node().await?;
 
     Ok(())
 }

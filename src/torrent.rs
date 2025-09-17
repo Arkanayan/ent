@@ -104,7 +104,7 @@ impl TorrentInfo {
             temp_sha1.copy_to_slice(&mut piece_sha1);
 
             let p_len = if index == (num_pieces - 1) {
-                (length - ((num_pieces - 1) as u32 * piece_length) as u64) as u32
+                (length - ((num_pieces - 1) as u64 * piece_length as u64) as u64) as u32
             } else {
                 piece_length
             };

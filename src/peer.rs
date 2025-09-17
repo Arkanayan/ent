@@ -835,7 +835,8 @@ impl PeerSession {
             num_peers,
         );
 
-        info!(target: "peer::connection:pick_blocks", num_blocks_picked = interesting_pieces.len(), picks = ?interesting_pieces);
+        info!(target: "peer::connection::pick_blocks", num_blocks_picked = interesting_pieces.len());
+        trace!(target: "peer::connection::pick_blocks", picks = ?interesting_pieces);
 
         let strict_end_game_mode = true; // TODO - Move it into a config
 

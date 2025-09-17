@@ -276,14 +276,14 @@ impl PiecePicker {
         let num_partials = self.piece_downloads.len();
         let mut num_blocks = num_blocks;
 
-		// prevent the number of partial pieces to grow indefinitely
-		// make this scale by the number of peers we have. For large
-		// scale clients, we would have more peers, and allow a higher
-		// threshold for the number of partials
-		// the second condition is to make sure we cap the number of partial
-		// _bytes_. The larger the pieces are, the fewer partial pieces we want.
-		// 2048 corresponds to 32 MiB
-		// TODO: 2 make the 2048 limit configurable
+        // prevent the number of partial pieces to grow indefinitely
+        // make this scale by the number of peers we have. For large
+        // scale clients, we would have more peers, and allow a higher
+        // threshold for the number of partials
+        // the second condition is to make sure we cap the number of partial
+        // _bytes_. The larger the pieces are, the fewer partial pieces we want.
+        // 2048 corresponds to 32 MiB
+        // TODO: 2 make the 2048 limit configurable
         let prioritize_partials =
             num_partials > num_peers * 3 / 2 || num_partials * self.blocks_per_piece() > 2048;
 
@@ -322,7 +322,8 @@ impl PiecePicker {
                 if !self.is_piece_free(piece.index, pieces) {
                     continue;
                 }
-                if piece.download_state != State::Open && piece.download_state != State::Downloading {
+                if piece.download_state != State::Open && piece.download_state != State::Downloading
+                {
                     continue;
                 }
                 if piece.download_state == State::Downloading {
@@ -377,7 +378,7 @@ impl PiecePicker {
             let blocks = &dp.blocks;
 
             for (index, block) in blocks.iter().enumerate() {
-                info!("P/b: {}/{}, status: {:?}", dp.index, index, block.state);
+                trace!("P/b: {}/{}, status: {:?}", dp.index, index, block.state);
                 if block.state != BlockStatus::Free {
                     continue;
                 }
@@ -547,9 +548,8 @@ impl PiecePicker {
                 block.state = BlockStatus::Requested;
 
                 dp.requested += 1;
-
             }
-            self.pieces[piece_index].download_state = dbg!(dp.get_piece_state());
+            self.pieces[piece_index].download_state = dp.get_piece_state();
         }
 
         true

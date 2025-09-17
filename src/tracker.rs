@@ -135,7 +135,7 @@ where
 
 pub async fn get_peer_details_from_tracker(torrent: &MetaInfo, peer_id: &PeerID) -> Result<TrackerData> {
     let tracker_url = torrent.announce.as_deref().unwrap();
-    // let tracker_url = torrent.announce_list.as_ref().unwrap()[1][0].as_str();
+    // let tracker_url = torrent.announce_list.as_ref().unwrap()[0][0].as_str();
     let info_hash = torrent.info_hash();
     let escaped_hash = url_encode_bytes(&info_hash);
     let peer_id = str::from_utf8(peer_id)?;
